@@ -70,6 +70,8 @@ python gitreal.py . --once --no-server
 
 [AGENT_SETUP.md](AGENT_SETUP.md) is the deterministic end-to-end runbook for small or low-context models.
 
+[SKILL.md](SKILL.md) is the **GIT_REAL CLOSEOUT** agent skill: when the user says "do a GIT_REAL CLOSEOUT", the agent ends the session with the repository proven clean — commit and push only under `GO` bands, hard-stop on secrets, exact receipt at the end. Drop it into your agent's skills directory or let the installer's agent-instructions block point to it.
+
 ## What it detects
 
 - Dirty, staged, untracked, conflicting, junk, and large files.

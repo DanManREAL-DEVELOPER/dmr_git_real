@@ -14,6 +14,7 @@ REQUIRED = (
     "README.md",
     "SETUP_GUIDE.html",
     "AGENT_SETUP.md",
+    "SKILL.md",
     "PRIVACY.md",
     "SECURITY.md",
     "CONTRIBUTING.md",
