@@ -1036,7 +1036,7 @@ def build_state(repo: GitRepo, config: dict) -> dict:
 
     # topology (#3): own repo vs tracked-inside-a-parent (half-extracted standalone)
     top = repo.toplevel()
-    if top and os.path.normpath(top) != os.path.normpath(root):
+    if top and os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(root)):
         state["topology"] = {
             "kind": "tracked_inside_parent",
             "toplevel": top,

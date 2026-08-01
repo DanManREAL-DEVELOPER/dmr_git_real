@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">GIT_REAL emblem</title>
+  <desc id="desc">A split blue and green repository shield containing a G and R monogram, a two-node git spine, and a cyan verification check.</desc>
+  <defs>
+    <linearGradient id="blueFace" x1="0" y1="0" x2="0.84" y2="1">
+      <stop offset="0" stop-color="#25D0F7"/>
+      <stop offset="0.38" stop-color="#079CF7"/>
+      <stop offset="0.72" stop-color="#086AF0"/>
+      <stop offset="1" stop-color="#0A43D7"/>
+    </linearGradient>
+    <linearGradient id="greenFace" x1="0.05" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#22F0BD"/>
+      <stop offset="0.45" stop-color="#05DFA0"/>
+      <stop offset="0.74" stop-color="#00C98A"/>
+      <stop offset="1" stop-color="#009D70"/>
+    </linearGradient>
+    <linearGradient id="cyanFace" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#35EEF3"/>
+      <stop offset="0.55" stop-color="#11DDE1"/>
+      <stop offset="1" stop-color="#00BEBB"/>
+    </linearGradient>
+
+    <linearGradient id="blueDepth" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#07306C"/>
+      <stop offset="1" stop-color="#00112E"/>
+    </linearGradient>
+    <linearGradient id="greenDepth" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#064D43"/>
+      <stop offset="1" stop-color="#001D23"/>
+    </linearGradient>
+    <linearGradient id="cyanDepth" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#075262"/>
+      <stop offset="1" stop-color="#001A2C"/>
+    </linearGradient>
+
+    <linearGradient id="blueEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#C7FCFF" stop-opacity="0.96"/>
+      <stop offset="0.35" stop-color="#8EF7FF" stop-opacity="0.72"/>
+      <stop offset="0.72" stop-color="#31BFFF" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#176EFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="greenEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#D4FFF7" stop-opacity="0.96"/>
+      <stop offset="0.35" stop-color="#8DFFE4" stop-opacity="0.72"/>
+      <stop offset="0.72" stop-color="#21E3AE" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#00A87D" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="cyanEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#D7FFFF" stop-opacity="0.95"/>
+      <stop offset="0.45" stop-color="#78F7FF" stop-opacity="0.60"/>
+      <stop offset="1" stop-color="#08B8C0" stop-opacity="0"/>
+    </linearGradient>
+
+    <filter id="glowBlue" x="-30%" y="-30%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <filter id="glowGreen" x="-30%" y="-30%" width="160%" height="170%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <filter id="glowCyan" x="-35%" y="-35%" width="170%" height="180%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+
+    <mask id="spineCutouts" maskUnits="userSpaceOnUse" x="430" y="270" width="170" height="540">
+      <rect x="430" y="270" width="170" height="540" fill="white"/>
+      <circle cx="512" cy="345" r="23" fill="black"/>
+      <circle cx="512" cy="600" r="23" fill="black"/>
+    </mask>
+
+    <!-- Canonical face geometry. The left and right paths are unified monograms, not stroked approximations. -->
+    <path id="leftShape" d="
+      M 483 176
+      L 151 357
+      C 138 364 131 375 131 389
+      L 134 738
+      C 134 751 141 759 153 766
+      L 374 893
+      L 378 608
+      C 354 604 333 596 314 585
+      L 313 540
+      L 436 470
+      L 437 403
+      L 272 489
+      C 259 496 251 509 251 524
+      L 253 607
+      C 253 621 260 629 274 637
+      L 315 660
+      L 313 783
+      L 195 713
+      L 195 406
+      L 483 247
+      Z"/>
+
+    <path id="rightShape" d="
+      M 541 176
+      L 541 245
+      L 829 406
+      L 829 713
+      L 765 751
+      L 723 649
+      L 757 632
+      C 767 627 772 617 772 604
+      L 771 521
+      C 771 507 764 498 753 491
+      L 588 402
+      L 588 470
+      L 711 539
+      L 710 585
+      L 641 605
+      L 736 842
+      L 876 761
+      C 886 755 891 746 891 734
+      L 891 389
+      C 891 375 883 363 872 356
+      L 553 177
+      C 549 175 545 174 541 176
+      Z"/>
+
+    <path id="checkShape" d="
+      M 661 771
+      L 626 739
+      L 506 862
+      L 450 807
+      L 415 842
+      L 507 931
+      Z"/>
+  </defs>
+
+  <!-- Controlled 3D depth: a single 14-unit extrusion, no noisy raster bevel. -->
+  <g aria-hidden="true" opacity="0.98">
+    <use href="#leftShape" transform="translate(0 14)" fill="url(#blueDepth)"/>
+    <use href="#rightShape" transform="translate(0 14)" fill="url(#greenDepth)"/>
+    <g transform="translate(0 14)" mask="url(#spineCutouts)" fill="url(#cyanDepth)">
+      <rect x="500" y="345" width="25" height="438" rx="12.5"/>
+      <circle cx="512" cy="345" r="50"/>
+      <circle cx="512" cy="600" r="49"/>
+    </g>
+    <use href="#checkShape" transform="translate(0 14)" fill="url(#cyanDepth)"/>
+  </g>
+
+  <!-- Restrained colored aura lives behind the face and never alters the source color. -->
+  <g aria-hidden="true">
+    <use href="#leftShape" fill="#087CFF" opacity="0.24" filter="url(#glowBlue)"/>
+    <use href="#rightShape" fill="#00E29D" opacity="0.22" filter="url(#glowGreen)"/>
+    <g mask="url(#spineCutouts)" fill="#13E3E8" opacity="0.20" filter="url(#glowCyan)">
+      <rect x="500" y="345" width="25" height="438" rx="12.5"/>
+      <circle cx="512" cy="345" r="50"/>
+      <circle cx="512" cy="600" r="49"/>
+    </g>
+    <use href="#checkShape" fill="#13E3E8" opacity="0.22" filter="url(#glowCyan)"/>
+  </g>
+
+  <!-- Premium face layers: gradients plus deliberately restrained edge light. -->
+  <g>
+    <use href="#leftShape" fill="url(#blueFace)"/>
+    <use href="#leftShape" fill="none" stroke="#001B53" stroke-opacity="0.35" stroke-width="7" transform="translate(0 3)" stroke-linejoin="round"/>
+    <use href="#leftShape" fill="none" stroke="url(#blueEdge)" stroke-width="4.5" stroke-linejoin="round"/>
+  </g>
+
+  <g>
+    <use href="#rightShape" fill="url(#greenFace)"/>
+    <use href="#rightShape" fill="none" stroke="#003A33" stroke-opacity="0.34" stroke-width="7" transform="translate(0 3)" stroke-linejoin="round"/>
+    <use href="#rightShape" fill="none" stroke="url(#greenEdge)" stroke-width="4.5" stroke-linejoin="round"/>
+  </g>
+
+  <g>
+    <g mask="url(#spineCutouts)" fill="url(#cyanFace)">
+      <rect x="500" y="345" width="25" height="438" rx="12.5"/>
+      <circle cx="512" cy="345" r="50"/>
+      <circle cx="512" cy="600" r="49"/>
+    </g>
+    <g mask="url(#spineCutouts)" fill="none" stroke="url(#cyanEdge)" stroke-width="3.5">
+      <rect x="500" y="345" width="25" height="438" rx="12.5"/>
+      <circle cx="512" cy="345" r="50"/>
+      <circle cx="512" cy="600" r="49"/>
+    </g>
+    <use href="#checkShape" fill="url(#cyanFace)"/>
+    <use href="#checkShape" fill="none" stroke="url(#cyanEdge)" stroke-width="3.5" stroke-linejoin="round"/>
+  </g>
+</svg>
