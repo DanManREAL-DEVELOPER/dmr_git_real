@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Safe, dependency-free installer for the GIT_REAL drop-in tool."""
+"""Safe, dependency-free installer for the GIT_REAL v1.2 drop-in tool."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import stat
@@ -112,14 +111,22 @@ def ensure_gitignore(target: Path) -> str:
             encoding="utf-8",
         )
         return "UPDATED .gitignore"
-    path.write_text("# GIT_REAL local reports and backups\n" + line + "\n", encoding="utf-8")
+    path.write_text(
+        "# GIT_REAL local reports and backups\n" + line + "\n",
+        encoding="utf-8",
+    )
     return "CREATED .gitignore"
 
 
 def wire_agents(target: Path) -> str:
-    result = run([sys.executable, "gitreal.py", str(target), "--wire-agents"], cwd=target)
+    result = run(
+        [sys.executable, "gitreal.py", str(target), "--wire-agents"],
+        cwd=target,
+    )
     if result.returncode != 0:
-        raise SetupError("Agent wiring failed: " + (result.stderr.strip() or result.stdout.strip()))
+        raise SetupError(
+            "Agent wiring failed: " + (result.stderr.strip() or result.stdout.strip())
+        )
     return "WIRED agent instructions"
 
 
@@ -128,8 +135,8 @@ def hook_block() -> str:
         [
             HOOK_BEGIN,
             "if command -v python3 >/dev/null 2>&1; then GIT_REAL_PY=python3; else GIT_REAL_PY=python; fi",
-            '"$GIT_REAL_PY" gitreal.py . --once --no-server --fail-on-secret --fail-under 80 || {',
-            '  echo "GIT_REAL blocked this commit. Read .git-real/git-real.json." >&2',
+            '"$GIT_REAL_PY" gitreal.py . --quick --json --operation commit_index >/dev/null || {',
+            '  echo "GIT_REAL blocked this commit. Run the explicit commit_index check and read its reasons." >&2',
             "  exit 1",
             "}",
             HOOK_END,
@@ -157,43 +164,83 @@ def install_precommit_hook(target: Path) -> str:
     return action
 
 
+def fresh_state(target: Path) -> dict:
+    result = run(
+        [
+            sys.executable,
+            "gitreal.py",
+            str(target),
+            "--quick",
+            "--json",
+        ],
+        cwd=target,
+    )
+    if result.returncode != 0:
+        raise SetupError(
+            "GIT_REAL verification run failed: "
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+    try:
+        state = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SetupError("Verification failed: stdout was not valid GIT_REAL JSON.") from exc
+
+    required = {
+        "version",
+        "schema_version",
+        "publication_id",
+        "root",
+        "is_repo",
+        "read_complete",
+        "read_errors",
+        "actions",
+    }
+    missing = sorted(required.difference(state))
+    if missing:
+        raise SetupError("Verification failed: JSON keys missing: " + ", ".join(missing))
+    if state.get("version") != "1.2.0" or state.get("schema_version") != 2:
+        raise SetupError("Verification failed: expected GIT_REAL v1.2 schema 2.")
+    if state.get("is_repo") is not True:
+        raise SetupError("Verification failed: target was not recognized as a Git repository.")
+    if state.get("read_complete") is not True or state.get("read_errors"):
+        raise SetupError("Verification failed: repository read was incomplete.")
+    try:
+        observed_root = Path(str(state["root"])).resolve()
+    except (TypeError, OSError) as exc:
+        raise SetupError("Verification failed: JSON root is invalid.") from exc
+    if observed_root != target.resolve():
+        raise SetupError("Verification failed: JSON root does not match the target.")
+    commit_action = (state.get("actions") or {}).get("commit_index")
+    if not isinstance(commit_action, dict) or commit_action.get("operation") != "commit_index":
+        raise SetupError("Verification failed: commit_index action evidence is missing.")
+    return state
+
+
 def verify_install(target: Path, expect_agents: bool) -> dict:
     for name in RUNTIME_FILES:
         if not (target / name).is_file():
             raise SetupError(f"Verification failed: {name} is missing from the target.")
-    result = run(
-        [sys.executable, "gitreal.py", str(target), "--once", "--no-server"],
-        cwd=target,
-    )
-    if result.returncode != 0:
-        raise SetupError("GIT_REAL verification run failed: " + (result.stderr.strip() or result.stdout.strip()))
-    report = target / ".git-real" / "git-real.json"
-    if not report.is_file():
-        raise SetupError("Verification failed: .git-real/git-real.json was not created.")
-    try:
-        state = json.loads(report.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SetupError("Verification failed: the generated JSON is unreadable.") from exc
-    required = {"version", "generated_at", "root", "is_repo", "scores", "secrets", "scan"}
-    missing = sorted(required.difference(state))
-    if missing:
-        raise SetupError("Verification failed: JSON keys missing: " + ", ".join(missing))
-    if state.get("is_repo") is not True:
-        raise SetupError("Verification failed: target was not recognized as a Git repository.")
-    if state.get("secrets"):
-        raise SetupError("Verification stopped: GIT_REAL detected a possible secret in the target.")
-    scan = state.get("scan") or {}
-    if scan.get("truncated"):
-        raise SetupError("Verification stopped: the working-tree secret scan was incomplete.")
+    state = fresh_state(target)
     if expect_agents:
-        candidates = [target / name for name in ("CLAUDE.md", "AGENTS.md", ".cursorrules")]
-        if not any(path.is_file() and AGENT_BEGIN in path.read_text(encoding="utf-8", errors="replace") for path in candidates):
-            raise SetupError("Verification failed: no managed agent instruction block was found.")
+        candidates = [
+            target / name
+            for name in ("CLAUDE.md", "AGENTS.md", ".cursorrules")
+        ]
+        if not any(
+            path.is_file()
+            and AGENT_BEGIN
+            in path.read_text(encoding="utf-8", errors="replace")
+            for path in candidates
+        ):
+            raise SetupError(
+                "Verification failed: no managed agent instruction block was found."
+            )
+    commit_action = state["actions"]["commit_index"]
     return {
-        "version": state.get("version"),
-        "safe_commit_band": (state.get("scores") or {}).get("safe_commit_band"),
-        "safe_discard_band": (state.get("scores") or {}).get("safe_delete_band"),
-        "secret_count": len(state.get("secrets") or []),
+        "version": state["version"],
+        "schema_version": state["schema_version"],
+        "read_complete": state["read_complete"],
+        "commit_index_decision": commit_action.get("decision"),
     }
 
 
@@ -203,16 +250,24 @@ def check_install(target: Path) -> None:
         if not (target / name).is_file():
             problems.append(f"missing {name}")
     ignore = target / ".gitignore"
-    if not ignore.is_file() or ".git-real/" not in ignore.read_text(encoding="utf-8", errors="replace").splitlines():
+    if (
+        not ignore.is_file()
+        or ".git-real/"
+        not in ignore.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()
+    ):
         problems.append(".git-real/ is not an exact .gitignore line")
     if problems:
         raise SetupError("CHECK_FAIL: " + "; ".join(problems))
+    fresh_state(target)
     print("GIT_REAL_CHECK_PASS")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Install and verify GIT_REAL inside an existing project without network access."
+        description="Install and verify GIT_REAL v1.2 inside an existing project without network access."
     )
     parser.add_argument("target", nargs="?", default=".", help="project directory to protect")
     parser.add_argument("--init", action="store_true", help="initialize Git if the target is not a repository")
@@ -243,7 +298,10 @@ def main() -> int:
             actions.append(install_precommit_hook(target))
         receipt = None
         if not args.no_verify:
-            receipt = verify_install(target, expect_agents=not args.no_wire_agents)
+            receipt = verify_install(
+                target,
+                expect_agents=not args.no_wire_agents,
+            )
         for action in actions:
             print(action)
         if receipt is not None:

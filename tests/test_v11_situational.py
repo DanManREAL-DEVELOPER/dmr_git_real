@@ -37,14 +37,14 @@ with tempfile.TemporaryDirectory() as tmp:
     os.makedirs(child)
     # workspace root repo
     subprocess.run(["git", "init", "-q", "-b", "main", root], check=True)
-    _git(root, "config", "user.email", "developer@example.invalid")
+    _git(root, "config", "user.email", "situational@example.invalid")
     _git(root, "config", "user.name", "t")
     open(os.path.join(root, "root.txt"), "w").write("root\n")
     _git(root, "add", "root.txt")
     _git(root, "commit", "-qm", "root init")
     # nested child repo
     subprocess.run(["git", "init", "-q", "-b", "main", child], check=True)
-    _git(child, "config", "user.email", "developer@example.invalid")
+    _git(child, "config", "user.email", "situational@example.invalid")
     _git(child, "config", "user.name", "t")
     open(os.path.join(child, "app.txt"), "w").write("l1\nl2\n")
     _git(child, "add", "app.txt")
@@ -87,6 +87,37 @@ with tempfile.TemporaryDirectory() as tmp:
     reasons = " ".join(st_junk["scores"]["safe_commit_reasons"])
     check("#4 names large file + size", "big.bin" in reasons and "MB" in reasons, reasons[:80])
     check("#4 names build artifact path", "node_modules" in reasons)
+
+    # #4b staged payload size comes from the index. Git LFS keeps a small
+    # pointer there while the working tree contains the expanded asset.
+    lfs_path = os.path.join(child, "asset.uasset")
+    open(lfs_path, "wb").write(b"x" * 6_000_000)
+    pointer = (b"version https://git-lfs.github.com/spec/v1\n"
+               b"oid sha256:" + b"0" * 64 + b"\nsize 6000000\n")
+    oid = subprocess.run(
+        ["git", "-C", child, "hash-object", "-w", "--stdin"],
+        input=pointer, check=True, capture_output=True,
+    ).stdout.decode().strip()
+    _git(child, "update-index", "--add", "--cacheinfo", f"100644,{oid},asset.uasset")
+    _git(child, "update-index", "--skip-worktree", "asset.uasset")
+    st_lfs = g.build_state(g.GitRepo(child), {})
+    lfs_entry = next(f for f in st_lfs["files"] if f["path"] == "asset.uasset")
+    check("#4b staged LFS pointer uses index size",
+          lfs_entry["size"] == len(pointer) and lfs_entry["staged_size"] == len(pointer),
+          str(lfs_entry))
+    check("#4b expanded LFS working file is not commit bloat",
+          not lfs_entry["large"] and lfs_entry["working_size"] == 6_000_000,
+          str(lfs_entry))
+
+    # Ordinary staged binaries still warn because their index blobs are large.
+    direct_path = os.path.join(child, "direct-large.bin")
+    open(direct_path, "wb").write(b"y" * 6_000_000)
+    _git(child, "add", "direct-large.bin")
+    st_direct = g.build_state(g.GitRepo(child), {})
+    direct_entry = next(f for f in st_direct["files"] if f["path"] == "direct-large.bin")
+    check("#4b ordinary staged large file still warns",
+          direct_entry["large"] and direct_entry["size"] == 6_000_000,
+          str(direct_entry))
 
     # #6 push weight
     pw = st_child["push_weight"]

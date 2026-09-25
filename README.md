@@ -17,39 +17,32 @@
   <sub>one file &middot; zero required dependencies &middot; <code>python gitreal.py</code> &middot; Linux / macOS / Windows / WSL2</sub>
 </p>
 
-<p align="center">
-  <a href="https://github.com/DanManREAL-DEVELOPER/dmr_git_real/actions/workflows/ci.yml"><img src="https://github.com/DanManREAL-DEVELOPER/dmr_git_real/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license">
-  <img src="https://img.shields.io/badge/telemetry-none-brightgreen" alt="No telemetry">
-</p>
-
 ---
 
 ## Get protected in three steps
 
-**1. Download or clone this repository.**
+**1. Clone this repository.**
 
 ```bash
 git clone https://github.com/DanManREAL-DEVELOPER/dmr_git_real.git
 cd dmr_git_real
 ```
 
-**2. Point the installer at the project you want protected** (any Git repo on your machine):
+**2. Install GIT_REAL into the repository you want protected.**
 
 ```bash
 python setup_gitreal.py "/absolute/path/to/your/project" --with-hook
 ```
 
-**3. Look for the receipt.** Setup succeeded only if the last line is exactly:
+**3. Require the exact receipt.**
 
 ```text
 GIT_REAL_SETUP_PASS
 ```
 
-That's it. Your project now has the live verdict file, the dashboard, the agent contract wired into your agent instruction files, and a pre-commit guard.
-
-Prefer a hand-held walkthrough? Open [`SETUP_GUIDE.html`](./SETUP_GUIDE.html) in a browser. Running a small or low-context agent? Hand it [`AGENT_SETUP.md`](./AGENT_SETUP.md) — a deterministic runbook with exact pass/fail receipts.
+The installer copies the v1.2 engine, wires the operation-specific agent contract,
+adds `.git-real/` to `.gitignore`, and can install a fail-closed pre-commit check.
+For a deterministic agent runbook, use [`AGENT_SETUP.md`](./AGENT_SETUP.md).
 
 ## The problem
 
@@ -63,32 +56,43 @@ GIT_REAL answers that. Visually for you, and in machine-readable JSON for the ag
 
 ## The fix: your agents read the verdict, not you
 
-Every run writes a machine-readable verdict to **`.git-real/git-real.json`**, refreshed on every change. Point your agents' own instruction files at it, and the "dirty tree?" question gets answered by the agent **before** it commits or discards - so it never lands on you.
+GIT_REAL v1.2 uses **operation-specific preservation checks**. A clean working tree,
+an ignored path, or a directory named `build/` is not blanket permission to delete
+anything. The legacy scores remain summaries; the generic discard score never
+returns `GO`. Agents must use the explicit action result instead.
 
 Drop this into your repo's `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, or any agent's system instructions:
 
-> **Before any `git commit`, `git checkout .`, `git clean -fd`, or `git reset --hard`:**
->
-> **Step 1 - refresh:** run `python gitreal.py . --once` (or call the MCP tool, which is always live; skip the refresh if GIT_REAL is already running and watching this repo). The file stamps `generated_at` so you can tell if it is stale.
->
-> **Step 2 - read `.git-real/git-real.json` and act:**
-> - `scores.safe_commit_band` not `"GO"` (or `scores.safe_commit` < 80): **do not commit** - surface `scores.safe_commit_reasons` and fix them first.
-> - `scores.safe_delete_band` not `"GO"`: **do not discard the tree** - there is unsaved work in `scores.safe_delete_reasons`.
-> - `secrets[]` non-empty: **stop and warn the user** - a secret is about to be committed.
+> Refresh for the **actual repository root** immediately before assessing an action.
+> Require `schema_version == 2`, `read_complete == true`, and no `read_errors`.
+> For a plain commit of the current index, require
+> `actions.commit_index.safe == true` and `decision == "ALLOW"`.
+> For deletion/reset/stash removal, select the exact supported operation and target;
+> require that action's `safe == true` and `decision == "ALLOW"`.
+> Missing evidence, unsupported flags, or an unspecified operation is not approval.
+> A watcher, an earlier JSON file, or a score alone is not fresh evidence.
+
+Fast read-only JSON, with no dashboard files written:
+
+```bash
+python gitreal.py /absolute/repository/root --quick --json
+```
+
+An explicit check, **not execution**, for a plain `git clean -fd`:
+
+```bash
+python gitreal.py /absolute/repository/root --quick --json --operation clean_untracked
+```
+
+Exit status is `0` for a complete read/allowed requested action, `1` for a denied
+requested action, and nonzero for a failed read or publication. A status-only
+exit `0` does not mean every action is allowed.
 
 Or let GIT_REAL install it for you: `python gitreal.py --wire-agents` injects this block into your `CLAUDE.md` / `AGENTS.md` / `.cursorrules` as an idempotent managed block (re-running replaces it, never duplicates; it creates `AGENTS.md` if none of them exist).
 
-That's the whole trick - and it's what no other git tool does. Everything else renders your repo's state for a *human* to read. GIT_REAL writes a *verdict an agent acts on*, turning "there's a dirty tree here, what do you want to do?" into a call the agent already made. Want it live mid-task instead of from a file? The [MCP server](#agent-integration-mcp) exposes the same verdict as callable tools.
-
-## The GIT_REAL CLOSEOUT
-
-Ending a session is where work gets lost and secrets get committed. So this distribution ships [`SKILL.md`](./SKILL.md): an agent skill that turns the phrase **"do a GIT_REAL CLOSEOUT"** into a fixed ritual — refresh the verdict, hard-stop on secrets, commit only under a `GO` band, push, leave no stashes or stray branches, and end with an exact receipt:
-
-```text
-GIT_REAL_CLOSEOUT_PASS
-```
-
-Drop `SKILL.md` into your agent's skills directory (for Claude Code: `.claude/skills/git-real-closeout/SKILL.md`), or paste its steps into any agent's instructions. If any gate fails, the agent must answer `GIT_REAL_CLOSEOUT_BLOCKED` plus the one blocking reason — never a polite fake pass.
+The [MCP server](#agent-integration-mcp) exposes the same engine. It reads repository
+state on each call. Reconnect after changing the engine or adapter source: a loaded
+v1.2 process detects that change and fails closed rather than claiming current rules.
 
 ## Three ways to run it
 
@@ -104,41 +108,60 @@ python gitreal.py ~/projects --all
 # scans every git repo under the folder and puts them on ONE wall
 ```
 
-The FLEET wall shows every repo as a card with its safe-commit and safe-discard scores, dirty count, side-branch count, and push state, sorted most-dangerous-first, with any repo containing secrets flashing red. Click a card for the full breakdown.
+The FLEET wall shows every repo as a card with its safe-commit and safe-discard scores, dirty count, side-branch count, and push state, sorted most-dangerous-first. Click a card for the full breakdown.
 
 **MCP, so your agents can call it** (see [Agent integration](#agent-integration-mcp) below).
 
 ## What it tracks
 
-- **Every dirty, staged, and untracked file**, classified the moment it appears: `DIRTY`, `STAGED`, `NEW` (precious, never committed), `JUNK` (build artifact), `CONFLICT`.
-- **Push state**: branch, upstream, ahead/behind, and every unpushed commit.
+- **Dirty, staged, untracked, and conflicted paths**, including lossless rename and unusual-filename handling. Untracked directories may be collapsed. Names are review hints, not proof of disposability.
+- **Publication evidence**: branch, upstream, exact ahead/behind counts, all-local-ref unpublished commit counts (including tags/custom refs), and a bounded current-upstream preview. No remote-tracking history means unknown publication, not zero unpushed work. Remote-tracking refs are local observations, not live server verification.
 - **Main and side branches**: flags side branches that are unmerged or unpushed so stranded agent work stops vanishing.
-- **Secrets**: content and filename detection (`.env`, `*.pem`, AWS / OpenAI / Anthropic / Stripe / GitHub keys, JWTs, DB URLs, snake_case `db_password` style keys, and more) with a blinking red alert. Matches are masked so the JSON never leaks the secret.
-- **Secret-in-history** (with `--history`): walks the **full commit graph** and flags secrets that were ALREADY COMMITTED (an incident, rotate and scrub) versus only in the working tree (caught in time) — including secrets that were committed and later deleted.
-- **Ignored files**: a clean collapsed list (`node_modules/` as one row, not 10,000).
-- **.gitignore suggestions**: junk found outside `.gitignore` is surfaced so you can add it (via the CLI or the GIT_REAL MCP — the dashboard is read-only).
+- **Ignored paths and empty untracked directories**: collapsed inventories protect paths that ordinary status does not show. Ignored data blocks ignored-file cleaning, not unrelated staged commits.
+- **Hidden index flags, worktrees, stashes, and active Git operations**: unknown/read-failed inventories cannot masquerade as empty collections.
+- **.gitignore suggestions**: possible artifacts are suggestions only. Ignoring a path is neither a backup nor deletion authorization.
 
-Got fixtures or sample files with deliberately-fake secrets? Drop a `# git-real:allow` comment on the line, or list path globs in a `.gitrealallow` file at the repo root (one per line; a bare `tests/` covers everything beneath it) to keep them from red-alerting.
 
-## The two scores
+## Exact operation contract
 
-GIT_REAL turns "what do I do with this tree?" into two numbers, recomputed every refresh, each with its reasons spelled out:
+| Operation | Exact assessed scope | Preservation rule |
+|---|---|---|
+| `commit_index` | Plain `git commit` of the inspected index | Staged candidate, structural checks, named branch, no conflict or active operation. Not `-a`, amend, or path arguments. |
+| `discard_tracked` | `git restore --worktree -- .`, from the index | No unstaged changes, conflicts, or status-hidden paths. Staged-only work remains in the index. |
+| `clean_untracked` | `git clean -fd` | No untracked candidates, including empty directories. No second force flag. |
+| `clean_ignored` | `git clean -fdx` | No untracked or ignored candidates. No second force flag. |
+| `reset_hard` | Nonrecursive reset to an explicit commit | Target preserves current HEAD ancestry; no dirty/hidden tracked work; a different target cannot have unproven local-path collisions. Use the returned resolved OID, not a mutable branch name. |
+| `drop_stash` | One selected `stash@{N}` | Canonical stash ancestry and exact saved index, worktree, and untracked deltas durably present in the retained current branch. Working-tree presence alone is insufficient. |
 
-- **Safe to Commit %**: how clean a commit would be right now. Secrets or an un-ignored `.env` crash it toward 0 (`DO NOT COMMIT`). Junk, huge files, or a 200-file accidental `git add -A` knock it down.
-- **Safe to Discard %**: how safe it is to nuke the dirty tree (`git checkout .` / `git clean -fd`). New untracked source you would lose forever crashes it toward 0 (`DO NOT DISCARD, UNSAVED WORK`). Only build artifacts dirty keeps it high.
+These checks do not perform the action or grant user authorization. Other checkout
+targets, force-push, branch/worktree removal, recursive submodule operations,
+`stash clear`, and additional flags are **not assessed**. Preserve work and follow
+the owner's workflow instead of translating a different action's `ALLOW` into permission.
 
-A clean tree is `100 / 100`. A tree with a secret plus new uncommitted code is `0 / 0`, reasons listed.
+The commit score evaluates the actual index when staged changes exist; otherwise
+it is only a working-tree preview. Filename-based local-data/key exclusions are
+not a content secret scan. Neither score is a statistical probability or a backup.
+The compatibility discard score is capped below `GO` so old score-only consumers
+fail conservatively during migration.
+
+All-local-ref coverage can include **retained archive tags or backup history**,
+not just new commits awaiting delivery. Preserve and classify those refs; never
+push archived history or delete its only reference merely to make a counter zero.
 
 ## Agent integration (MCP)
 
 The [agent hook](#the-fix-your-agents-read-the-verdict-not-you) above works straight from the JSON file - no server needed. For agents that prefer to **call** the check live mid-task ("checking GIT_REAL before I touch this tree"), GIT_REAL also ships an MCP server for Claude Code, Codex, or any MCP client - the same verdict, exposed as tools.
 
-Tools exposed: `is_safe_to_commit`, `is_safe_to_discard`, `list_secrets`, `secrets_in_history`, `git_real_status`, `git_real_fleet`, `gitignore_add`.
+Tools exposed: `is_safe_to_commit`, `is_safe_to_discard`, `git_real_status`, `git_real_fleet`, `gitignore_add`.
 
-`git_real_status` returns each side branch with its last commit subject and your unpushed commits, so an agent can tell you WHAT a branch you forgot actually was, instead of disappearing into `git log` for twenty minutes.
+`git_real_status` returns schema/publication metadata, read completeness, actual
+conflicts, exact local `main`/`origin/main` equality, worktrees, hidden-index count,
+actions and a local closeout summary. Incomplete counts are `null`, not zero.
+`is_safe_to_discard(path, operation, target)` requires the exact operation; omitting
+it returns `DO_NOT_DISCARD`, even for a clean repository.
 
 ```bash
-python -m pip install -r requirements-mcp.txt   # the MCP SDK (only needed for the MCP server, not the dashboard)
+pip install mcp          # the MCP SDK (only needed for the MCP server, not the dashboard)
 ```
 
 **Claude Code** (run from where `gitreal_mcp.py` lives, use the absolute path):
@@ -157,58 +180,42 @@ command = "python"
 args = ["/abs/path/to/gitreal_mcp.py"]
 ```
 
-Verify with `claude mcp list` or `/mcp` inside either tool. `gitreal_mcp.py` imports the `gitreal.py` next to it, so it always reflects your current rules.
+Verify the connected client's tools and returned `version`/`schema_version` after
+reconnecting. A process started before an upgrade must be replaced; modifying a
+Python source file does not hot-reload an already running MCP server.
 
-**No MCP?** You don't need it - that's the [agent hook above](#the-fix-your-agents-read-the-verdict-not-you): point `CLAUDE.md` / `AGENTS.md` at `.git-real/git-real.json` and your agents read the verdict straight from the file. MCP is the live, callable version of the same verdict.
+**No MCP?** Use the fresh CLI JSON or the request-bound file workflow above. An
+agent instruction file can name that workflow, but an existing JSON file must
+not be treated as current merely because a watcher is running.
 
 ## Guardrail mode (pre-commit / CI)
 
-Use `--once` with exit codes to block bad commits:
+Use an explicit index check for a commit gate:
 
 ```bash
-python gitreal.py . --once --fail-on-secret --fail-under 80
-#   exit 2  a secret was detected
-#   exit 1  safe-commit score is below 80
-#   exit 0  clean
+python gitreal.py . --quick --json --operation commit_index
 ```
 
-**Wire it as a git hook** so a bad commit is actually *blocked*, not just reported. The installer's `--with-hook` flag does this for you; to do it by hand, point the hook at wherever `gitreal.py` lives:
+A pre-commit hook may use that command's exit code. File-based consumers should
+generate a unique token, pass `--quick --once --request-id TOKEN`, and require the
+same `request_id`, a new `publication_id`, the exact canonical root, schema 2,
+complete reads, and `actions.commit_index` ALLOW/true. JSON publication is atomic;
+write failures are nonzero and never reported as a successful fresh snapshot.
+Pushes use ordinary Git transport; GIT_REAL does not implement a pre-push gate.
 
+Fleet telemetry across selected repositories (not authorization for every action):
 ```bash
-# .git/hooks/pre-commit  (chmod +x it)
-#!/bin/sh
-python /abs/path/to/gitreal.py . --once --fail-on-secret --fail-under 80 || {
-  echo "GIT_REAL blocked this commit - read .git-real/git-real.json"; exit 1;
-}
-```
-
-```bash
-# .git/hooks/pre-push  (chmod +x it) - heavier: also audits already-committed history
-#!/bin/sh
-python /abs/path/to/gitreal.py . --once --fail-on-secret --history || {
-  echo "GIT_REAL blocked this push - a secret is in your working tree or history"; exit 1;
-}
-```
-
-(Prefer a hook manager? Drop the same `--once` command into a [`pre-commit`](https://pre-commit.com/) `local` hook.)
-
-Across every repo at once:
-```bash
-python gitreal.py ~/projects --all --once --fail-on-secret   # CI guard for your whole workspace
-
-# audit for already-committed secrets (incidents) in history:
-python gitreal.py . --once --history
+python gitreal.py ~/projects --all --quick --once
 ```
 
 ## Project layout - single file, on purpose
 
-`gitreal.py` is the whole tool: the watcher, the scoring, the secret + secret-in-history
-scanner, and the dashboard HTML all live in that one file. No build step, no framework,
-no `src/` maze - drop it in and run. `gitreal_mcp.py` (the MCP server), `setup_gitreal.py`
-(the installer), and `tests/` sit beside it; brand assets live in `assets/`.
+`gitreal.py` is the whole tool: watcher, Git-state scoring, worktree analysis and dashboard HTML live in one file—
+no `src/` maze. Drop it in and run. `gitreal_mcp.py` (the MCP server) and `tests/` sit
+beside it; brand assets live in `assets/`.
 
 *Contributors: please keep it flat.* The single-file design is the feature, not an
-oversight - it's what makes GIT_REAL a true drop-in. See [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+oversight - it's what makes GIT_REAL a true drop-in.
 
 ## Install
 
@@ -227,9 +234,12 @@ python gitreal.py [PATH] [options]
   --all / --fleet    FLEET mode: scan PATH for ALL repos (the multi-repo wall)
   --port N           dashboard port (default: 8787)
   --once             generate output once and exit (CI / pre-commit)
+  --quick            metadata inventory; defer deep stash/push-weight telemetry
+  --json             print fresh JSON without writing dashboard files
+  --operation NAME   assess one supported operation; never execute it
+  --target VALUE     explicit reset commit or selected stash ref
+  --request-id TOKEN echo a caller's unique refresh token
   --fail-under N     guardrail: exit 1 if safe-commit < N
-  --fail-on-secret   guardrail: exit 2 if any secret is detected
-  --history          also scan git history: flag secrets ALREADY COMMITTED (incidents)
   --poll             force polling watcher (use on /mnt/c or network drives)
   --no-server        write files only, no dashboard server
   --interval S       rescan/poll interval seconds (default: 4)
@@ -245,14 +255,21 @@ python gitreal.py [PATH] [options]
 
 ```jsonc
 {
-  "scores": {
-    "safe_commit": 0, "safe_commit_label": "DO NOT COMMIT",
-    "safe_commit_reasons": ["3 secret(s) detected in changed files, DO NOT COMMIT."],
-    "safe_delete": 0, "safe_delete_label": "DO NOT DISCARD, UNSAVED WORK",
-    "safe_delete_reasons": ["2 new untracked file(s) would be PERMANENTLY lost (never committed)."]
+  "schema_version": 2,
+  "version": "1.2.0",
+  "read_complete": true,
+  "read_errors": [],
+  "root": "/absolute/repository/root",
+  "publication_id": "unique-per-inspection",
+  "remote_verification": "LOCAL_TRACKING_REFS_ONLY",
+  "actions": {
+    "clean_untracked": {
+      "safe": false,
+      "decision": "BLOCK",
+      "reasons": ["Untracked paths have no proven durable copy."]
+    }
   },
-  "files": [{ "path": "newfeature.py", "category": "new", "has_secret": false }],
-  "secrets": [{ "file": ".env", "line": 1, "type": "AWS Access Key ID", "severity": "critical", "masked": "AKIA******1234" }],
+  "files": [{ "path": "newfeature.py", "category": "new" }],
   "side_branches": [{ "name": "feature/x", "merged_into_default": false, "pushed": false }],
   "unpushed": [{ "hash": "a1b2c3d", "subject": "wip" }]
 }
@@ -260,42 +277,26 @@ python gitreal.py [PATH] [options]
 
 FLEET writes `.git-real/git-real-fleet.json` with `totals` plus a per-repo summary array.
 
-## Privacy boundary
-
-GIT_REAL has no telemetry. Its core does not upload repository data.
-
-The local `.git-real/` output can contain absolute paths, repository names, file names, branch names, commit subjects, stash messages, and remote metadata. The installer adds that directory to `.gitignore`. Do not publish or attach `.git-real/` without reviewing it.
-
-Read [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md) before using reports outside the local machine.
-
-## Validate this distribution
-
-```bash
-python scripts/release_check.py
-```
-
-Successful release validation ends with:
-
-```text
-GIT_REAL_RELEASE_CHECK_PASS
-```
-
 ## Known limitations
 
-- **GIT_REAL detects; it does not enforce.** On its own it watches a repo and writes a verdict (`.git-real/git-real.json` + the dashboard) - it never blocks a commit or push by itself. To turn the verdict into an actual gate, wire it as a git hook (see [Guardrail mode](#guardrail-mode-pre-commit--ci) above) or call the same `--once` command from CI. An agent reading the verdict is the other half: GIT_REAL surfaces the signal, you decide what stops on it.
-- The built-in secret scanner is a curated regex plus entropy set: fast and dependency-free, not exhaustive. Optional [`gitleaks`](https://github.com/gitleaks/gitleaks) / [`detect-secrets`](https://github.com/Yelp/detect-secrets) backends are on the roadmap.
-- Scans are bounded (file size, file count) so huge repos stay snappy.
-- The scores are heuristics to kill guesswork, not guarantees. Read the reasons.
+- **Snapshots are not atomic execution locks.** Repeated metadata observations detect some changes during inspection, but another process can write after a path/ref was observed. Refresh immediately before acting, coordinate writers, and never reuse a snapshot after a state change. No read-only scan can prevent a future writer.
+- **Recovery evidence is deliberately conservative.** Untracked/ignored content is not approved for deletion merely because it resembles output. Some safely redundant work will still require an explicit preservation workflow. A stash with multiple saved variants may remain blocked even after one variant is committed.
+- **Closeout is not live remote verification.** `LOCAL_STATE_COMPLETE` proves the inspected local state against local tracking refs only. Delivery workflows must separately establish current remote synchronization. Missing refs, malformed data, read failures and stale loaded code are not clean states.
+- **No content secret scanner, backup service, or automatic enforcement.** The dashboard/MCP is advisory evidence unless a hook or agent follows it. A hook can also be bypassed. SSH identity fields are configuration hints, never proof of authenticated identity.
 
-## Roadmap
+## Regression checks
 
-- One-click safe actions (stash / clean-junk-only / commit)
-- Optional `gitleaks` / `detect-secrets` backend
-- Time-machine activity log, optional TUI, README status badge
+The adversarial suite uses disposable repositories, including untracked artifacts,
+ignored data, hidden index flags, unusual filenames, clean-but-ahead branches,
+stash variants, read failures, stale publication, and explicit no-op scopes.
+
+```bash
+python -m pytest tests/test_adversarial_safety.py tests/test_wave43_grc.py -q
+```
 
 ## The story
 
-Why a solo dev built this, and the secret-scanner blind spot one of his own agents caught while prepping the launch: [`Background_Story.md`](./Background_Story.md).
+Why a solo dev built this: [`Background_Story.md`](./Background_Story.md).
 
 ## License
 

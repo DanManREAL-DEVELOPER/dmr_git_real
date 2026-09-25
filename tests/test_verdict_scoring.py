@@ -3,9 +3,7 @@
 scoring and verdict logic (compute_scores, check_commit, check_discard).
 
 These are the core gate functions that every AI agent calls before touching a git
-tree.  The existing tests cover secret *detection* but nothing pins that the
-actual numeric scores + BLOCK / DO_NOT_DISCARD recommendations are correct —
-this closes that gap.
+tree. They pin the numeric scores plus BLOCK / DO_NOT_DISCARD recommendations.
 
 Run:  python3 tests/test_verdict_scoring.py   (exit 0 = all pass)
 """
@@ -46,7 +44,7 @@ def _make_repo():
     """Create a fresh temp git repo with local identity so commits work."""
     d = tempfile.mkdtemp()
     _git(d, "init", "-q")
-    _git(d, "config", "user.email", "developer@example.invalid")
+    _git(d, "config", "user.email", "scoring@example.invalid")
     _git(d, "config", "user.name",  "gitreal-test")
     _git(d, "checkout", "-q", "-b", "main")
     return d
@@ -102,9 +100,7 @@ def test_score_bounds():
 
 
 # ---------------------------------------------------------------------------
-# TEST 2: clean + committed → safe to commit (not BLOCK)
-#   A fully-committed, clean working tree should produce a favorable verdict.
-#   score >= 40 and recommendation != BLOCK.
+# TEST 2: clean + committed is a preview, not authorization for a future index.
 # ---------------------------------------------------------------------------
 def test_clean_committed_is_not_blocked():
     d = _make_repo()
@@ -118,52 +114,14 @@ def test_clean_committed_is_not_blocked():
 
         check("clean_committed: safe_commit_pct >= 40",
               r["safe_commit_pct"] >= 40)
-        check("clean_committed: recommendation is not BLOCK",
-              r["recommendation"] != "BLOCK")
-        check("clean_committed: secrets_present is False",
-              r["secrets_present"] is False)
+        check("clean_committed: no staged candidate is not authorized",
+              r["recommendation"] == "BLOCK" and r["safe"] is False)
     finally:
         import shutil; shutil.rmtree(d, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# TEST 3: secret in working tree → BLOCK
-#   A fake AWS key (same pattern the existing tests prove is caught) in an
-#   untracked file must push the recommendation to BLOCK and raise the
-#   secrets_present flag.
-#
-#   Pattern reused from test_secret_detection.py case "AWS secret - env style":
-#     AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-#   That line is already proven to trigger detection in the detection regression.
-# ---------------------------------------------------------------------------
-def test_secret_in_tree_is_blocked():
-    d = _make_repo()
-    try:
-        # initial clean commit so the repo has a HEAD
-        with open(os.path.join(d, "app.py"), "w") as fh:
-            fh.write("x = 1\n")
-        _git(d, "add", "app.py")
-        _git(d, "commit", "-qm", "initial")
-
-        # plant a fake secret in an untracked file  # gitleaks:allow
-        with open(os.path.join(d, "secrets_leak.txt"), "w") as fh:
-            fh.write("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n")  # gitleaks:allow
-
-        r = mcp.check_commit(d)
-
-        check("secret_blocks_commit: secrets_present is True",
-              r["secrets_present"] is True)
-        check("secret_blocks_commit: recommendation is BLOCK",
-              r["recommendation"] == "BLOCK")
-        # The score formula pins secrets → sc ≤ 3; definitely < 40
-        check("secret_blocks_commit: safe_commit_pct is very low (< 40)",
-              r["safe_commit_pct"] < 40)
-    finally:
-        import shutil; shutil.rmtree(d, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# TEST 4: uncommitted changes → discard is NOT fully safe
+# TEST 3: uncommitted changes → discard is NOT fully safe
 #   A modified tracked file subtracts 30 points from the safe-discard score
 #   (see compute_scores in gitreal.py).  The resulting score sits in the
 #   CAUTION band (40-79), so the verdict is "CAUTION - REVIEW FIRST" — the
@@ -204,7 +162,7 @@ def test_uncommitted_changes_block_discard():
 
 
 # ---------------------------------------------------------------------------
-# TEST 5: new untracked file → DO_NOT_DISCARD
+# TEST 4: new untracked file → DO_NOT_DISCARD
 #   A new, never-committed file would be permanently lost on clean/reset.
 #   safe-discard must be low and flag DO_NOT_DISCARD.
 # ---------------------------------------------------------------------------
@@ -232,7 +190,7 @@ def test_new_untracked_blocks_discard():
 
 
 # ---------------------------------------------------------------------------
-# TEST 6: clean tree is safe to discard
+# TEST 5: clean tree is safe to discard
 #   After a commit with nothing left dirty, discarding is a no-op: score == 100
 #   and recommendation == "OK_TO_DISCARD".
 # ---------------------------------------------------------------------------
@@ -244,7 +202,7 @@ def test_clean_tree_is_safe_to_discard():
         _git(d, "add", "clean.txt")
         _git(d, "commit", "-qm", "clean commit")
 
-        r = mcp.check_discard(d)
+        r = mcp.check_discard(d, operation="clean_untracked")
 
         check("clean_discard: recommendation is OK_TO_DISCARD",
               r["recommendation"] == "OK_TO_DISCARD")
@@ -255,7 +213,7 @@ def test_clean_tree_is_safe_to_discard():
 
 
 # ---------------------------------------------------------------------------
-# TEST 7: required dict keys are always present
+# TEST 6: required dict keys are always present
 #   The consuming agents destructure specific keys; missing keys = runtime crash.
 # ---------------------------------------------------------------------------
 def test_required_keys_present():
@@ -264,8 +222,7 @@ def test_required_keys_present():
         r_commit  = mcp.check_commit(d)
         r_discard = mcp.check_discard(d)
 
-        commit_required  = {"path", "safe_commit_pct", "verdict", "secrets_present",
-                            "reasons", "recommendation"}
+        commit_required = {"path", "safe_commit_pct", "verdict", "reasons", "recommendation"}
         discard_required = {"path", "safe_discard_pct", "verdict", "reasons",
                             "recommendation"}
 
@@ -283,7 +240,6 @@ def test_required_keys_present():
 def main():
     test_score_bounds()
     test_clean_committed_is_not_blocked()
-    test_secret_in_tree_is_blocked()
     test_uncommitted_changes_block_discard()
     test_new_untracked_blocks_discard()
     test_clean_tree_is_safe_to_discard()

@@ -15,7 +15,6 @@ It will:
   * immediately begin tracking git end-to-end (modified / staged / untracked /
     branches / push state / stashes / ignored)
   * classify every new file as DIRTY until committed
-  * detect secrets and raise a blinking ALERT
   * compute Safe-Commit% and Safe-Delete% scores (answers: "is it safe to commit
     this?" and "is it safe to nuke this dirty tree?")
   * write two outputs that auto-refresh:
@@ -43,81 +42,30 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import html
 import http.server
 import json
-import math
 import os
 import re
 import socketserver
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+SCHEMA_VERSION = 2
+with open(__file__, "rb") as _source_file:
+    ENGINE_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()
 OUTPUT_DIRNAME = ".git-real"
 DEFAULT_PORT = 8787
 DEFAULT_INTERVAL = 4.0
-SCAN_SIZE_LIMIT = 1_000_000          # bytes; skip secret-scanning files larger than this
 LARGE_FILE_WARN = 5_000_000          # bytes; warn about big untracked/staged files
 LARGE_FILE_CRIT = 50_000_000         # bytes; Git-LFS territory
-MAX_SCAN_FILES = int(os.environ.get("GITREAL_MAX_SCAN_FILES", "600"))  # safety cap on number of files secret-scanned per pass
-HISTORY_TIME_BUDGET = float(os.environ.get("GITREAL_HISTORY_TIME_BUDGET", "15"))
-HISTORY_MAX_LINES = int(os.environ.get("GITREAL_HISTORY_MAX_LINES", "400000"))
 DEBOUNCE_SECONDS = 0.75              # collapse bursts of fs events into one rescan
-
-# Allowlisting (so a project's own fake fixtures / sample files don't red-alert).
-# Inline markers are gitleaks-compatible: drop one in a comment on the secret line.
-SECRET_ALLOW_MARKERS = ("gitleaks:allow", "git-real:allow", "gitreal:allow")
-# Optional repo-root file: one path glob per line (# comments ok), fnmatch / dir-prefix.
-ALLOWLIST_FILENAME = ".gitrealallow"
-
-# ----------------------------------------------------------------------------
-# secret detection
-# ----------------------------------------------------------------------------
-# (name, compiled regex, severity)  severity: "critical" | "high"
-_SECRET_RULES = [
-    ("AWS Access Key ID",      r"\b(AKIA|ASIA)[0-9A-Z]{16}\b", "critical"),
-    ("AWS Secret Access Key",  r"(?i)aws.{0,20}?(secret|access).{0,40}?['\"=:\s]([0-9A-Za-z/+]{40})\b", "critical"),
-    ("GitHub PAT (classic)",   r"\bgh[posru]_[0-9A-Za-z]{36}\b", "critical"),
-    ("GitHub PAT (fine)",      r"\bgithub_pat_[0-9A-Za-z_]{82}\b", "critical"),
-    ("GitLab PAT",             r"\bglpat-[0-9A-Za-z_\-]{20}\b", "critical"),
-    ("Stripe Secret Key",      r"\b[sr]k_live_[0-9A-Za-z]{20,}\b", "critical"),
-    ("Stripe Test Key",        r"\b[sr]k_test_[0-9A-Za-z]{20,}\b", "high"),
-    ("OpenAI API Key",         r"\bsk-(proj-)?[A-Za-z0-9_\-]{20,}\b", "critical"),
-    ("Anthropic API Key",      r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b", "critical"),
-    ("Google API Key",         r"\bAIza[0-9A-Za-z_\-]{35}\b", "critical"),
-    ("Google OAuth Client",    r"\b[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com\b", "high"),
-    ("Slack Token",            r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b", "critical"),
-    ("Slack Webhook",          r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{40,}", "high"),
-    ("Discord Bot Token",      r"\b[MN][A-Za-z0-9_\-]{23}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27}\b", "high"),
-    ("Discord Webhook",        r"https://discord(app)?\.com/api/webhooks/[0-9]{17,}/[A-Za-z0-9_\-]{60,}", "high"),
-    ("Twilio API Key",         r"\bSK[0-9a-fA-F]{32}\b", "high"),
-    ("SendGrid API Key",       r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b", "critical"),
-    ("npm Token",              r"\bnpm_[0-9A-Za-z]{36}\b", "critical"),
-    ("PyPI Token",             r"\bpypi-AgEIcHlwaS[A-Za-z0-9_\-]{50,}\b", "critical"),
-    ("Hugging Face Token",     r"\bhf_[A-Za-z0-9]{30,}\b", "high"),
-    ("Private Key Block",      r"-----BEGIN (RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----", "critical"),
-    ("JSON Web Token",         r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b", "high"),
-    # snake_case-aware: a secret-ish word may sit at the TAIL of a longer
-    # identifier (aws_secret_access_key, db_password, github_client_secret).
-    # \b failed across underscores; the (?:word[_-])* prefix + tail-anchored
-    # keyword catches those without over-matching e.g. my_token_count.
-    ("Generic Secret Assign",  r"(?i)(?:^|[^A-Za-z0-9_])(?:[A-Za-z0-9]+[_-])*(?:passwd|password|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[:=]\s*['\"][^'\"\s]{8,}['\"]", "high"),
-    ("Connection String",      r"(?i)\b(postgres|postgresql|mysql|mongodb(\+srv)?|redis|amqp)://[^:\s]+:[^@\s]+@", "high"),
-]
-SECRET_RULES = [(name, re.compile(pat), sev) for name, pat, sev in _SECRET_RULES]
-
-# Filenames that are secret-bearing by nature; ALERT if present and NOT gitignored.
-_SECRET_FILENAME_PATTERNS = [
-    r"^\.env$", r"^\.env\.(?!example$|sample$|template$|dist$).+",
-    r".*\.pem$", r".*\.key$", r"^id_(rsa|dsa|ecdsa|ed25519)$",
-    r".*\.p12$", r".*\.pfx$", r".*\.keystore$", r".*\.jks$",
-    r"^credentials$", r"^\.npmrc$", r"^\.pypirc$", r"^\.netrc$",
-    r"^secrets?\..+", r".*serviceaccount.*\.json$", r".*-key\.json$",
-]
-SECRET_FILENAME_RULES = [re.compile(p, re.IGNORECASE) for p in _SECRET_FILENAME_PATTERNS]
 
 # Untracked junk that should almost always be gitignored.
 JUNK_DIR_NAMES = {
@@ -164,63 +112,6 @@ BINARY_EXTS = {
 }
 
 
-def shannon_entropy(s: str) -> float:
-    if not s:
-        return 0.0
-    counts = {}
-    for ch in s:
-        counts[ch] = counts.get(ch, 0) + 1
-    n = len(s)
-    return -sum((c / n) * math.log2(c / n) for c in counts.values())
-
-
-def mask_secret(s: str) -> str:
-    s = s.strip().strip("'\"")
-    if len(s) <= 8:
-        return "****"
-    return f"{s[:4]}{'*' * 6}{s[-4:]}"
-
-
-# The "Generic Secret Assign" rule is the noisiest one; these two value shapes are
-# real code, NEVER a hardcoded credential, so suppressing them tightens that rule
-# without weakening detection (every real-secret fixture carries digits / symbols /
-# mixed case and matches NEITHER shape):
-#   - shell parameter expansion used as the value: "${VAR:-default}", "${VAR:=x}",
-#     "${VAR}", "$VAR", and nested forms "${A:-${B:-}}"  -> a $-reference, no literal.
-#   - low-entropy kebab/snake word literals: 'cookie-session', 'auth-token-cookie'
-#     -> letters-only dictionary words joined by - / _ with no entropy of a real key.
-_SHELL_REF_RE = re.compile(
-    r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=?+](.*))?\}$|^\$[A-Za-z_][A-Za-z0-9_]*$")
-_KEBAB_SNAKE_WORDS_RE = re.compile(r"^[A-Za-z]+(?:[_-][A-Za-z]+)+$")
-
-
-def _shell_value_benign(value: str) -> bool:
-    """True when `value` is composed only of shell parameter expansions / env refs
-    and (recursively) low-entropy default text - never a hardcoded secret. A
-    HIGH-entropy literal default (e.g. ${VAR:-<random-key>}) is NOT benign, so a
-    secret smuggled in as a shell default is still flagged."""
-    v = value.strip()
-    if not v:
-        return True
-    m = _SHELL_REF_RE.match(v)
-    if m:
-        default = m.group(2)        # text after :- / := / etc.; None for ${VAR} or $VAR
-        return True if default is None else _shell_value_benign(default)
-    # a plain literal default: benign only if it has no secret-like entropy
-    return shannon_entropy(v) < 3.0
-
-
-def generic_secret_value_is_benign(value: str) -> bool:
-    """True when a 'Generic Secret Assign' quoted value is a known non-secret shape
-    (shell expansion or low-entropy kebab/snake word literal). Detection-safe: real
-    credentials never take either form."""
-    if not value:
-        return False
-    if value.startswith("$") and _shell_value_benign(value):
-        return True
-    if _KEBAB_SNAKE_WORDS_RE.match(value) and shannon_entropy(value) < 3.5:
-        return True
-    return False
 
 
 # ----------------------------------------------------------------------------
@@ -284,15 +175,21 @@ def redact_url_credentials(url: str) -> str:
     """
     if not url:
         return url
-    return re.sub(r"^(https?://)[^@/]+@", r"\1***@", url)
+    def redact(match):
+        scheme, userinfo = match.group(1), match.group(2)
+        if scheme.lower().startswith(("http:", "https:")) or ":" in userinfo:
+            return scheme + "***@"
+        return match.group(0)
+    redacted = re.sub(r"^([a-z][a-z0-9+.-]*://)([^/@]+)@", redact, url, flags=re.I)
+    # Query strings/fragments are not required for displayed repository identity.
+    return re.sub(r"[?#].*$", "?[redacted]", redacted) if "://" in redacted else redacted
 
 
 def resolve_remote_identity(url: str, ssh_config_path: str | None = None) -> dict:
-    """Resolve a git remote URL to the account/identity a push will authenticate as.
+    """Display URL/basic Host-config hints, never authenticate or prove an account.
 
-    Accurate about ~/.ssh/config Host aliases (which pin an IdentityFile) versus
-    ambiguous bare hosts like github.com (identity = whatever default key/agent
-    answers, which may be the wrong account).
+    Includes, Match/exec, system config, command-line overrides and SSH agent
+    selection are outside this lightweight parser. No shell/config commands run.
     """
     # Never store credential-bearing userinfo. An HTTPS remote can carry a PAT
     # An HTTPS remote may contain a credential; the raw string would otherwise reach
@@ -303,12 +200,14 @@ def resolve_remote_identity(url: str, ssh_config_path: str | None = None) -> dic
         "is_ssh_alias": False,      # host string maps to a DIFFERENT real hostname
         "identity_pinned": False,   # ~/.ssh/config pins an IdentityFile for this host
         "identity_file": None, "real_host": None, "warning": None,
+        "authentication_verified": False,
+        "basis": "URL and basic user Host-block hints only; not effective SSH configuration or account proof",
     }
     if not url:
         return info
-    if url.startswith(("http://", "https://")):
+    if url.lower().startswith(("http://", "https://")):
         info["scheme"] = "https"
-        hm = re.match(r"https?://(?:[^@/]+@)?([^/]+)/", url)
+        hm = re.match(r"https?://(?:[^@/]+@)?([^/]+)/", url, flags=re.I)
         info["host"] = hm.group(1) if hm else None
         info["real_host"] = info["host"]
         info["warning"] = ("HTTPS remote - the push authenticates with a stored "
@@ -321,16 +220,21 @@ def resolve_remote_identity(url: str, ssh_config_path: str | None = None) -> dic
         return info
     info["scheme"] = "ssh"
     info["host"] = sm.group(2)
+    merged = {}
     for patterns, cfg in _parse_ssh_config(ssh_config_path):
-        if any(fnmatch.fnmatch(info["host"], pat) for pat in patterns):
-            real_host = cfg.get("hostname") or info["host"]
-            info["real_host"] = real_host
-            info["is_ssh_alias"] = real_host != info["host"]
-            info["identity_pinned"] = bool(cfg.get("identityfile"))
-            if cfg.get("identityfile"):
-                info["identity_file"] = os.path.basename(
-                    os.path.expanduser(cfg["identityfile"]))
-            break
+        positive = any(fnmatch.fnmatchcase(info["host"].lower(), pat.lower())
+                       for pat in patterns if not pat.startswith("!"))
+        negative = any(fnmatch.fnmatchcase(info["host"].lower(), pat[1:].lower())
+                       for pat in patterns if pat.startswith("!"))
+        if positive and not negative:
+            for key, value in cfg.items():
+                merged.setdefault(key, value)
+    if merged:
+        info["real_host"] = merged.get("hostname") or info["host"]
+        info["is_ssh_alias"] = info["real_host"] != info["host"]
+        info["identity_pinned"] = bool(merged.get("identityfile"))
+        if merged.get("identityfile"):
+            info["identity_file"] = os.path.basename(os.path.expanduser(merged["identityfile"]))
     if info["real_host"] is None:
         info["real_host"] = info["host"]
     # ambiguous only when a bare well-known host has NO pinned key and is NOT an alias
@@ -348,12 +252,17 @@ def resolve_remote_identity(url: str, ssh_config_path: str | None = None) -> dic
 class GitRepo:
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
+        self.read_errors: list[str] = []
 
-    def _run(self, *args, timeout=25):
+    def _run(self, *args, timeout=25, input_text=None):
         try:
             r = subprocess.run(
-                ["git", "-C", self.root, *args],
-                capture_output=True, text=True, timeout=timeout,
+                ["git", "--no-optional-locks", "-C", self.root,
+                 "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="surrogateescape", timeout=timeout,
+                input=input_text,
+                env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0"},
             )
             return r.stdout, r.returncode, r.stderr
         except FileNotFoundError:
@@ -362,6 +271,13 @@ class GitRepo:
             return "", 124, "git command timed out"
         except Exception as e:  # noqa: BLE001
             return "", 1, str(e)
+
+    def _required(self, *args, **kwargs):
+        """A failed required inventory is unknown, never an empty collection."""
+        out, rc, err = self._run(*args, **kwargs)
+        if rc:
+            self.read_errors.append(f"git {args[0]} inventory failed (rc={rc})")
+        return out, rc, err
 
     def is_repo(self) -> bool:
         out, rc, _ = self._run("rev-parse", "--is-inside-work-tree")
@@ -376,17 +292,26 @@ class GitRepo:
 
     # --- status -------------------------------------------------------------
     def status(self) -> dict:
-        """Parse `git status --porcelain=v2 --branch`."""
-        out, rc, _ = self._run("status", "--porcelain=v2", "--branch", "--untracked-files=normal")
+        """Parse NUL-delimited porcelain; collapsed directories are never disposable."""
+        out, rc, err = self._run(
+            "status", "--porcelain=v2", "-z", "--branch",
+            "--untracked-files=normal", "--ignore-submodules=none")
         data = {
             "branch": None, "upstream": None, "ahead": 0, "behind": 0,
             "detached": False, "oid": None,
             "staged": [], "modified": [], "untracked": [], "conflicts": [],
             "renamed": [],
+            "submodules": [], "ahead_behind_known": False,
+            "ok": rc == 0,
+            "complete": rc == 0,
+            "error": None if rc == 0 else (err.strip() or f"git status failed (rc={rc})"),
         }
         if rc != 0:
             return data
-        for line in out.splitlines():
+        records = iter(out.split("\0"))
+        for line in records:
+            if not line:
+                continue
             if line.startswith("# branch.head"):
                 head = line.split(" ", 2)[2]
                 if head == "(detached)":
@@ -399,39 +324,165 @@ class GitRepo:
                 m = re.search(r"\+(\d+)\s+-(\d+)", line)
                 if m:
                     data["ahead"], data["behind"] = int(m.group(1)), int(m.group(2))
+                    data["ahead_behind_known"] = True
             elif line.startswith("# branch.oid"):
                 data["oid"] = line.split(" ", 2)[2]
             elif line.startswith("1 ") or line.startswith("2 "):
-                parts = line.split(" ", 8)
+                renamed = line.startswith("2 ")
+                parts = line.split(" ", 9 if renamed else 8)
+                if len(parts) != (10 if renamed else 9) or len(parts[1]) != 2:
+                    data.update(ok=False, complete=False, error="Malformed porcelain status record")
+                    return data
                 xy = parts[1]
                 path = parts[-1]
-                if line.startswith("2 "):  # renamed/copied: path<TAB>orig
-                    path = path.split("\t")[0]
+                if renamed:
+                    original = next(records, None)
+                    if original is None:
+                        data.update(ok=False, complete=False, error="Truncated rename record")
+                        return data
                     data["renamed"].append(path)
+                if parts[2].startswith("S"):
+                    data["submodules"].append({"path": path, "state": parts[2]})
                 staged_flag, work_flag = xy[0], xy[1]
                 if staged_flag != ".":
-                    data["staged"].append({"path": path, "x": staged_flag})
+                    data["staged"].append({"path": path, "x": staged_flag,
+                                           "mode": parts[4], "oid": parts[7]})
                 if work_flag != ".":
                     data["modified"].append({"path": path, "y": work_flag})
             elif line.startswith("u "):
                 parts = line.split(" ", 10)
+                if len(parts) != 11:
+                    data.update(ok=False, complete=False, error="Malformed conflict record")
+                    return data
                 data["conflicts"].append(parts[-1])
             elif line.startswith("? "):
                 data["untracked"].append(line[2:])
+            elif not line.startswith("# "):
+                data.update(ok=False, complete=False, error="Unknown porcelain status record")
+                return data
+        if data["oid"] is None or (data["branch"] is None and not data["detached"]):
+            data.update(ok=False, complete=False, error="Missing porcelain branch evidence")
         return data
+
+    def index_blob_size(self, path: str) -> int | None:
+        """Return the staged blob size for *path*, or None when no blob is staged."""
+        out, rc, _ = self._required("cat-file", "-s", f":{path}")
+        if rc != 0:
+            return None
+        try:
+            return int(out.strip())
+        except (TypeError, ValueError):
+            self.read_errors.append("Malformed staged blob size")
+            return None
+
+    def index_inventory(self) -> dict:
+        """Metadata only: detect status-hidden work and fingerprint the index."""
+        out, rc, _ = self._required("ls-files", "--stage", "-v", "-z")
+        data = {"hidden_paths": [], "gitlinks": [],
+                "fingerprint": hashlib.sha256(out.encode("utf-8", "surrogateescape")).hexdigest()}
+        if rc:
+            return data
+        for row in out.split("\0"):
+            if not row:
+                continue
+            tag, _, rest = row.partition(" ")
+            meta, sep, path = rest.partition("\t")
+            fields = meta.split()
+            if not sep or len(tag) != 1 or len(fields) != 3:
+                self.read_errors.append("Malformed index inventory")
+                continue
+            if tag.islower() or tag.upper() == "S":
+                data["hidden_paths"].append({"path": path, "flag": tag})
+            if fields[0] == "160000":
+                data["gitlinks"].append(path)
+        return data
+
+    def worktrees(self) -> list[dict]:
+        out, rc, _ = self._required("worktree", "list", "--porcelain", "-z")
+        if rc:
+            return []
+        rows, row = [], {}
+        for field in out.split("\0"):
+            if not field:
+                if row:
+                    rows.append(row)
+                    row = {}
+                continue
+            key, _, value = field.partition(" ")
+            if key == "worktree":
+                row["path"] = value
+            else:
+                row[key] = value or True
+        if row:
+            rows.append(row)
+        if not rows or any(not r.get("path") for r in rows):
+            self.read_errors.append("Missing or malformed worktree inventory")
+        return rows
+
+    def refs_inventory(self) -> dict[str, str]:
+        out, rc, _ = self._required(
+            "for-each-ref", "--format=%(refname) %(objectname)")
+        refs = {}
+        if not rc:
+            for line in out.splitlines():
+                fields = line.split()
+                if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40,64}", fields[1]):
+                    self.read_errors.append("Malformed ref inventory")
+                    continue
+                refs[fields[0]] = fields[1]
+        return refs
+
+    def staged_blob_sizes(self, staged: list[dict]) -> dict[str, int]:
+        oids = sorted({s["oid"] for s in staged
+                       if s.get("x") != "D" and s.get("mode") != "160000"
+                       and re.fullmatch(r"[0-9a-f]{40,64}", s.get("oid", ""))})
+        if not oids:
+            return {}
+        out, rc, _ = self._required(
+            "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            input_text="\n".join(oids) + "\n")
+        sizes = {}
+        for line in out.splitlines() if not rc else []:
+            fields = line.split()
+            if len(fields) == 3 and fields[0] in oids and fields[1] == "blob" and fields[2].isdigit():
+                sizes[fields[0]] = int(fields[2])
+            else:
+                self.read_errors.append("Staged blob metadata is missing or malformed")
+        if len(sizes) != len(oids):
+            self.read_errors.append("Staged blob size inventory is incomplete")
+        return sizes
+
+    def operation_markers(self) -> dict:
+        names = ("index.lock", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                 "rebase-merge", "rebase-apply", "sequencer", "BISECT_START")
+        out, rc, _ = self._required("rev-parse", "--git-path", "index")
+        if rc or not out.strip():
+            return {"index_locked": True, "active_operations": ["unknown"]}
+        index = out.rstrip("\n")
+        if not os.path.isabs(index):
+            index = os.path.join(self.root, index)
+        gitdir = os.path.dirname(index)
+        return {"index_locked": os.path.lexists(index + ".lock"),
+                "active_operations": [n for n in names[1:] if os.path.lexists(os.path.join(gitdir, n))]}
 
     def ignored_entries(self) -> list[str]:
         """Ignored files, directories collapsed (node_modules/ as one entry)."""
-        out, rc, _ = self._run(
-            "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"
+        out, rc, _ = self._required(
+            "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"
         )
         if rc != 0:
             return []
-        return [l for l in out.splitlines() if l.strip()]
+        return [entry for entry in out.split("\0") if entry]
+
+    def untracked_entries(self) -> list[str]:
+        """Include empty directories, which status omits but clean -d removes."""
+        out, rc, _ = self._required(
+            "ls-files", "--others", "--directory", "--exclude-standard", "-z")
+        return [entry for entry in out.split("\0") if entry] if not rc else []
 
     def branches(self) -> list[dict]:
         fmt = "%(refname:short)\t%(upstream:short)\t%(upstream:track)\t%(committerdate:relative)\t%(objectname:short)\t%(contents:subject)"
-        out, rc, _ = self._run("for-each-ref", f"--format={fmt}", "refs/heads")
+        out, rc, _ = self._required("for-each-ref", f"--format={fmt}", "refs/heads")
         result = []
         if rc != 0:
             return result
@@ -456,19 +507,19 @@ class GitRepo:
         return None
 
     def merged_branches(self, base: str) -> set[str]:
-        out, rc, _ = self._run("branch", "--merged", base, "--format=%(refname:short)")
+        out, rc, _ = self._required("branch", "--merged", base, "--format=%(refname:short)")
         if rc != 0:
             return set()
         return {l.strip() for l in out.splitlines() if l.strip()}
 
     def unpushed_commits(self, has_upstream: bool) -> list[dict]:
         # No upstream tracking branch -> there is nothing to be "ahead" of, so
-        # nothing is pending-push. (Previously this returned the last 20 commits,
-        # which made every remote-less/local-only repo look like it had unpushed
-        # work.) A repo with no remote cannot have unpushed commits.
+        # This is only a current-upstream subject preview. Without an upstream,
+        # leave the preview empty; build_state separately reports publication
+        # uncertainty and all-local-ref coverage. Empty preview is not proof.
         if not has_upstream:
             return []
-        out, rc, _ = self._run("log", "@{upstream}..HEAD", "--pretty=%h\t%s", "-n", "50")
+        out, rc, _ = self._required("log", "@{upstream}..HEAD", "--pretty=%h\t%s", "-n", "50")
         if rc != 0:
             return []
         commits = []
@@ -479,7 +530,7 @@ class GitRepo:
         return commits
 
     def stashes(self) -> list[str]:
-        out, rc, _ = self._run("stash", "list")
+        out, rc, _ = self._required("stash", "list")
         if rc != 0:
             return []
         return [l for l in out.splitlines() if l.strip()]
@@ -492,7 +543,7 @@ class GitRepo:
         return {"hash": h, "author": an, "when": ar, "subject": s}
 
     def remotes(self) -> list[str]:
-        out, rc, _ = self._run("remote")
+        out, rc, _ = self._required("remote")
         if rc != 0:
             return []
         return [l for l in out.splitlines() if l.strip()]
@@ -522,15 +573,29 @@ class GitRepo:
         except Exception:  # noqa: BLE001
             return None
 
-    def stash_details(self, limit: int = 25) -> list[dict]:
+    def stash_details(self, limit: int | None = None) -> list[dict]:
         """Per-stash triage so a caller can tell dead/superseded from unmerged work.
 
         verdict: 'empty' (captured nothing) | 'superseded' (reverse-applies to the
-        tree, i.e. already present) | 'unmerged' (content NOT cleanly in the tree -
-        PRESERVE before dropping) | 'unknown'.
+        working tree) | 'unmerged' (content NOT cleanly in the working tree -
+        PRESERVE before dropping) | 'unknown' (inspection failed).
+
+        Reverse-apply proves working-tree presence, not committed recovery in HEAD.
+        Untracked stash parents are included. A failed show is unknown, not empty.
         """
-        out, rc, _ = self._run("stash", "list", "--format=%gd%x00%gs%x00%cr")
-        if rc != 0 or not out.strip():
+        if limit is None:
+            limit = int(os.environ.get("GITREAL_STASH_INSPECT_LIMIT", "200"))
+        out, rc, err = self._run("stash", "list", "--format=%gd%x00%gs%x00%cr")
+        if rc != 0:
+            return [{
+                "ref": None, "message": "", "age": "", "files": None,
+                "added": 0, "deleted": 0,
+                "already_in_working_tree": None, "already_in_head": None,
+                "presence_basis": "working_tree",
+                "verdict": "unknown", "inspection_ok": False,
+                "error": err.strip() or f"stash list failed (rc={rc})",
+            }]
+        if not out.strip():
             return []
         details = []
         for line in out.splitlines():
@@ -542,7 +607,20 @@ class GitRepo:
             age = parts[2] if len(parts) > 2 else ""
             if not ref:
                 continue
-            stat_out, _, _ = self._run("stash", "show", "--numstat", ref)
+            if len(details) >= limit:
+                continue
+            stat_out, stat_rc, stat_err = self._run(
+                "stash", "show", "--include-untracked", "--numstat", ref)
+            if stat_rc != 0:
+                details.append({
+                    "ref": ref, "message": msg, "age": age, "files": None,
+                    "added": 0, "deleted": 0,
+                    "already_in_working_tree": None, "already_in_head": None,
+                    "presence_basis": "working_tree",
+                    "verdict": "unknown", "inspection_ok": False,
+                    "error": stat_err.strip() or f"stash show failed (rc={stat_rc})",
+                })
+                continue
             files = added = deleted = 0
             for sline in stat_out.splitlines():
                 cols = sline.split("\t")
@@ -553,10 +631,24 @@ class GitRepo:
                     if cols[1].isdigit():
                         deleted += int(cols[1])
             already = None
+            inspection_ok = True
             if files > 0:
-                patch, pc, _ = self._run("stash", "show", "-p", ref)
-                if pc == 0 and patch.strip():
+                patch, pc, perr = self._run(
+                    "stash", "show", "--include-untracked", "-p", ref)
+                if pc != 0:
+                    details.append({
+                        "ref": ref, "message": msg, "age": age, "files": files,
+                        "added": added, "deleted": deleted,
+                        "already_in_working_tree": None, "already_in_head": None,
+                        "presence_basis": "working_tree",
+                        "verdict": "unknown", "inspection_ok": False,
+                        "error": perr.strip() or f"stash show -p failed (rc={pc})",
+                    })
+                    continue
+                if patch.strip():
                     already = self._patch_reverse_applies(patch)
+                    if already is None:
+                        inspection_ok = False
             if files == 0:
                 verdict = "empty"
             elif already is True:
@@ -568,10 +660,12 @@ class GitRepo:
             details.append({
                 "ref": ref, "message": msg, "age": age, "files": files,
                 "added": added, "deleted": deleted,
-                "already_in_head": already, "verdict": verdict,
+                "already_in_working_tree": already,
+                "already_in_head": None,
+                "presence_basis": "working_tree",
+                "verdict": verdict,
+                "inspection_ok": inspection_ok and verdict != "unknown",
             })
-            if len(details) >= limit:
-                break
         return details
 
     # --- push weight --------------------------------------------------------
@@ -608,239 +702,35 @@ class GitRepo:
 
 
 # ----------------------------------------------------------------------------
-# classification + secret scan
+# working-tree classification
 # ----------------------------------------------------------------------------
 def classify_untracked(root: str, path: str) -> str:
-    base = path.rstrip("/").split("/")[-1]
-    is_dir = path.endswith("/") or os.path.isdir(os.path.join(root, path.rstrip("/")))
-    if is_dir and base in JUNK_DIR_NAMES:
-        return "junk"
-    if any(part in JUNK_DIR_NAMES for part in path.split("/")):
-        return "junk"
-    if any(r.match(base) for r in JUNK_FILE_RULES):
-        return "junk"
+    """Never infer recoverability from a filename, extension, or directory name.
+
+    A binary, backup, log, cache, or build directory can contain the only copy
+    of human work. Artifact hints remain available separately for commit review.
+    """
     return "new"
 
 
-def is_secret_filename(path: str) -> bool:
+def artifact_hint(path: str) -> bool:
+    """A name-based review hint, deliberately NOT deletion evidence."""
     base = path.rstrip("/").split("/")[-1]
-    if base.endswith(".pub"):
-        return False
-    return any(r.match(base) for r in SECRET_FILENAME_RULES)
-
-
-def looks_binary(root: str, path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
-    if ext in BINARY_EXTS:
+    if any(part in JUNK_DIR_NAMES for part in path.split("/")):
         return True
-    full = os.path.join(root, path)
-    try:
-        with open(full, "rb") as fh:
-            chunk = fh.read(4096)
-        return b"\x00" in chunk
-    except Exception:  # noqa: BLE001
-        return True
+    return any(r.match(base) for r in JUNK_FILE_RULES)
 
 
-def load_secret_allowlist(root: str, config: dict | None = None) -> list[str]:
-    """Repo-relative path globs whose secret findings are suppressed. Sourced from an
-    optional `.gitrealallow` file at the repo root plus config['secret_allowlist'].
-    Lets a project mark its own deliberately-fake test fixtures / sample files so the
-    scanner stops red-alerting them - without weakening detection anywhere else."""
-    globs: list[str] = []
-    p = os.path.join(root, ALLOWLIST_FILENAME)
-    try:
-        if os.path.isfile(p):
-            with open(p, "r", errors="replace") as fh:
-                for ln in fh:
-                    ln = ln.strip()
-                    if ln and not ln.startswith("#"):
-                        globs.append(ln)
-    except Exception:  # noqa: BLE001
-        pass
-    if config:
-        globs.extend(config.get("secret_allowlist", []) or [])
-    return globs
+def protected_commit_path(path: str) -> bool:
+    """Filename-only exclusion; this is not a repository-content secret scan."""
+    base = path.rsplit("/", 1)[-1].lower()
+    return (
+        (base == ".env" or base.startswith(".env.")) and base != ".env.example"
+        or base in {"id_rsa", "id_ed25519", "gcp-service-account.json"}
+        or base.endswith((".key", ".pem", ".p12", ".pfx", ".db", ".sqlite", ".sqlite3"))
+    )
 
 
-def path_allowlisted(path: str, globs) -> bool:
-    """True if `path` (repo-relative) matches an allowlist glob or sits under an
-    allowlisted directory prefix (so `tests/` covers `tests/a/b.py`)."""
-    if not globs:
-        return False
-    norm = (path or "").replace("\\", "/").rstrip("/")
-    for g in globs:
-        gp = g.replace("\\", "/").rstrip("/")
-        if not gp:
-            continue
-        if norm == gp or norm.startswith(gp + "/") or fnmatch.fnmatch(norm, g):
-            return True
-    return False
-
-
-def line_allowlisted(text: str) -> bool:
-    """True if the line carries an inline allow marker (gitleaks:allow / git-real:allow)."""
-    return any(m in text for m in SECRET_ALLOW_MARKERS)
-
-
-def scan_file_for_secrets(root: str, path: str, allow_globs=None) -> list[dict]:
-    full = os.path.join(root, path)
-    findings = []
-    if allow_globs and path_allowlisted(path, allow_globs):
-        return findings
-    try:
-        if os.path.getsize(full) > SCAN_SIZE_LIMIT:
-            return findings
-        if looks_binary(root, path):
-            return findings
-        with open(full, "r", errors="replace") as fh:
-            lines = fh.readlines()
-    except Exception:  # noqa: BLE001
-        return findings
-    for i, line in enumerate(lines, 1):
-        if len(line) > 2000:
-            line = line[:2000]
-        if line_allowlisted(line):
-            continue
-        for name, rx, sev in SECRET_RULES:
-            m = rx.search(line)
-            if m:
-                token = m.group(0)
-                if name == "Private Key Block" and not private_key_block_is_real(line):
-                    continue
-                # guards for the noisiest generic rule
-                if name == "Generic Secret Assign":
-                    # Extract the value with the SAME class the rule matched: a quoted
-                    # run of non-quote, non-space chars, 8+ long. A loose ([^'"]+) grab
-                    # over-captures across an apostrophe in prose (e.g. "the site's ...")
-                    # into a high-entropy English span that dodges the benign checks -- a
-                    # false positive. Real credentials carry no whitespace.
-                    val = re.search(r"['\"]([^'\"\s]{8,})['\"]", line)
-                    v = val.group(1) if val else ""
-                    if generic_secret_value_is_benign(v):
-                        continue
-                    if val and shannon_entropy(v) < 3.0:
-                        continue
-                findings.append({
-                    "file": path, "line": i, "type": name,
-                    "severity": sev, "masked": mask_secret(token),
-                })
-                break  # one finding per line is enough
-    return findings
-
-
-_PK_MARKER_RX = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----")
-
-
-def private_key_block_is_real(line: str) -> bool:
-    """Marker-only fixtures are not key material (2026-07-10 FP: a scanner
-    self-test asserting secretScan(<marker string>) fires). Real key evidence:
-    a bare PEM header line (the base64 body follows on the NEXT lines, which a
-    per-line scan can't see), or the marker followed by body material on the
-    same line (inline string with escaped newlines). A marker embedded in code
-    with no body after it is a fixture/reference, not a leak."""
-    m = _PK_MARKER_RX.search(line)
-    if not m:
-        return False
-    before = line[:m.start()].strip()
-    after = line[m.end():]
-    if not before and re.fullmatch(r"[\s'\"`,;)\]]*", after):
-        return True  # bare PEM header line — body follows on subsequent lines
-    return bool(re.search(r"^(?:\\+[nr]|\s)*[A-Za-z0-9+/=]{40,}", after))
-
-
-# ----------------------------------------------------------------------------
-# secret-in-history detection
-# ----------------------------------------------------------------------------
-def scan_history_for_secrets(root: str, allow_globs=None,
-                             time_budget: float = HISTORY_TIME_BUDGET,
-                             max_lines: int = HISTORY_MAX_LINES) -> tuple[list[dict], bool]:
-    """Walk the FULL commit graph (every ref, `git log --all -p`) and scan every ADDED
-    line for secrets. A hit means the secret was committed at some point - an incident,
-    NOT 'caught in time'. This catches a secret that was committed and then DELETED, which
-    a current-tree / tracked-blob scan reports clean (the old blind spot). Streams the diff
-    and bounds itself by wall-clock + line count; returns (incidents, truncated)."""
-    allow_globs = allow_globs or []
-    try:
-        proc = subprocess.Popen(
-            ["git", "-C", root, "log", "--all", "--no-merges", "--no-color",
-             "--no-decorate", "-U0", "-p"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, errors="replace", bufsize=1,
-        )
-    except Exception:  # noqa: BLE001
-        return [], False
-    incidents: list[dict] = []
-    seen: set = set()
-    cur_commit = None
-    cur_file = None
-    cur_allowed = False
-    truncated = False
-    n = 0
-    deadline = time.time() + time_budget
-    try:
-        for line in proc.stdout:
-            n += 1
-            if n > max_lines or ((n & 0x7FF) == 0 and time.time() > deadline):
-                truncated = True
-                break
-            if line.startswith("commit "):
-                m = re.match(r"commit ([0-9a-f]{7,40})", line)
-                if m:
-                    cur_commit = m.group(1)[:12]
-                continue
-            if line.startswith("diff --git"):
-                cur_file, cur_allowed = None, False
-                continue
-            if line.startswith("+++ "):
-                p = line[4:].strip()
-                cur_file = p[2:] if p.startswith("b/") else None
-                cur_allowed = bool(cur_file and path_allowlisted(cur_file, allow_globs))
-                continue
-            if not line.startswith("+") or line.startswith("+++"):
-                continue  # only ADDED lines (skip context / removed / +++ header)
-            if cur_allowed:
-                continue
-            text = line[1:]
-            if len(text) > 2000:
-                text = text[:2000]
-            if line_allowlisted(text):
-                continue
-            for name, rx, sev in SECRET_RULES:
-                m = rx.search(text)
-                if not m:
-                    continue
-                if name == "Private Key Block" and not private_key_block_is_real(text):
-                    continue
-                if name == "Generic Secret Assign":
-                    # Same value class as the rule (non-quote, non-space, 8+). A loose
-                    # ([^'"]+) grab over-captures across a prose apostrophe and produces a
-                    # false positive (see scan_file_for_secrets). No whitespace in real creds.
-                    val = re.search(r"['\"]([^'\"\s]{8,})['\"]", text)
-                    v = val.group(1) if val else ""
-                    if generic_secret_value_is_benign(v):
-                        continue
-                    if val and shannon_entropy(v) < 3.0:
-                        continue
-                masked = mask_secret(m.group(0))
-                key = (name, masked, cur_file)
-                if key in seen:
-                    break
-                seen.add(key)
-                incidents.append({"type": name, "file": cur_file or "(unknown)",
-                                  "severity": sev, "masked": masked,
-                                  "commit": cur_commit, "in_history": True})
-                break
-    finally:
-        try:
-            proc.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            proc.terminate()
-        except Exception:  # noqa: BLE001
-            pass
-    return incidents, truncated
 
 
 # ----------------------------------------------------------------------------
@@ -854,58 +744,97 @@ def verdict_band(score: int, positive_is_good=True) -> str:
     return "STOP"
 
 
-def compute_scores(state: dict) -> dict:
-    st = state["status"]
-    secrets = state["secrets"]
-    files = state["files"]
+def summarize_stashes(stash_lines: list[str], details: list[dict]) -> dict:
+    """Combine stash list + inspected detail. Truncation and unknown are first-class."""
+    list_failed = any(
+        d.get("ref") is None and d.get("inspection_ok") is False for d in details
+    )
+    if list_failed and not stash_lines:
+        err = next((d.get("error") for d in details if d.get("error")), "stash list failed")
+        return {
+            "count": None, "inspected": 0, "uninspected": None,
+            "empty": 0, "superseded": 0, "unmerged": 0, "unknown": 1,
+            "inspection_complete": False, "error": err,
+        }
+    inspected = [d for d in details if d.get("ref")]
+    unknown = sum(1 for d in inspected if d.get("verdict") == "unknown")
+    uninspected = max(0, len(stash_lines) - len(inspected))
+    complete = (
+        uninspected == 0
+        and unknown == 0
+        and all(d.get("inspection_ok", True) for d in inspected)
+    )
+    return {
+        "count": len(stash_lines),
+        "inspected": len(inspected),
+        "uninspected": uninspected,
+        "empty": sum(1 for d in inspected if d.get("verdict") == "empty"),
+        "superseded": sum(1 for d in inspected if d.get("verdict") == "superseded"),
+        "unmerged": sum(1 for d in inspected if d.get("verdict") == "unmerged"),
+        "unknown": unknown,
+        "inspection_complete": complete,
+    }
 
-    n_staged = len(st["staged"])
-    n_modified = len(st["modified"])
-    n_conflicts = len(st["conflicts"])
-    untracked_new = [f for f in files if f["category"] == "new"]
-    untracked_junk = [f for f in files if f["category"] == "junk"]
-    secret_files = [f for f in files if f.get("secret_filename")]
-    large_files = [f for f in files if f.get("large")]
-    has_dirty = bool(n_staged or n_modified or n_conflicts or untracked_new or untracked_junk)
-    unpushed = state["unpushed"]
+
+def compute_scores(state: dict) -> dict:
+    st = state.get("status") or {}
+    files = state.get("files") or []
+    read_failed = (
+        st.get("ok") is not True
+        or st.get("complete") is not True
+        or state.get("read_complete") is False
+    )
+    if read_failed:
+        reason = st.get("error") or "; ".join(state.get("read_errors") or []) or "Git read failed."
+        msg = f"Git status was not read successfully: {reason}"
+        return {
+            "safe_commit": 0, "safe_commit_band": "STOP",
+            "safe_commit_label": "GIT READ FAILED",
+            "safe_commit_reasons": [f"{msg} Not a verified clean tree."],
+            "safe_delete": 0, "safe_delete_band": "STOP",
+            "safe_delete_label": "GIT READ FAILED",
+            "safe_delete_reasons": [f"{msg} Discard is not approved."],
+            "unpreserved_work": ["unknown"],
+        }
+
+    n_staged = len(st.get("staged") or [])
+    n_modified = len(st.get("modified") or [])
+    n_conflicts = len(st.get("conflicts") or [])
+    untracked_new = [f for f in files if f.get("untracked") or f.get("category") in ("new", "junk")]
+    n_untracked = max(len(untracked_new), len(st.get("untracked") or []))
+    commit_files = [f for f in files if f.get("staged")] if n_staged else files
+    recorded_files = [f for f in commit_files if f.get("x") != "D"]
+    untracked_junk = [f for f in recorded_files if f.get("artifact_candidate") or f.get("category") == "junk"]
+    large_files = [f for f in recorded_files if f.get("large")]
+    protected = [f for f in recorded_files if protected_commit_path(f["path"])]
+    has_dirty = bool(n_staged or n_modified or n_conflicts or n_untracked)
+    unpushed = state.get("unpushed") or []
+    unpreserved = []
+    if n_conflicts:
+        unpreserved.append("conflicts")
+    if n_staged:
+        unpreserved.append("staged")
+    if n_modified:
+        unpreserved.append("modified")
+    if n_untracked:
+        unpreserved.append("untracked_new")
 
     # ---- Safe Commit % : how clean/safe is committing right now? ------------
     sc = 100
     sc_reasons = []
-    incidents = state.get("history_incidents", [])
-    if incidents:
-        sc = min(sc, 2)
-        sc_reasons.append(f"INCIDENT: {len(incidents)} secret(s) ALREADY COMMITTED to git history - rotate the key(s) and scrub history.")
-    if secrets:
-        sc = min(sc, 3)
-        wt_secrets = [s for s in secrets if not s.get("tracked")]
-        if wt_secrets:
-            sc_reasons.append(f"{len(wt_secrets)} secret(s) detected in changed files - DO NOT COMMIT.")
-    scan = state.get("scan", {})
-    if scan.get("truncated"):
-        # The secret scan hit its file cap, so a secret could be hiding past it.
-        # We CANNOT certify the tree clean - never report GO on an incomplete scan.
-        sc = min(sc, 60)
-        sc_reasons.append(
-            f"INCOMPLETE SCAN: only {scan.get('scanned', 0)} of {scan.get('candidates', 0)} "
-            f"file(s) secret-scanned (cap {scan.get('limit', MAX_SCAN_FILES)}); "
-            f"{scan.get('unscanned', 0)} file(s) NOT scanned - a secret could be hiding past the cap.")
-    if not has_dirty and not secrets:
+    if not has_dirty:
         sc_reasons.append("Working tree is clean - nothing to commit.")
     elif has_dirty:
-        if secret_files:
-            sc = min(sc, 8)
-            sc_reasons.append(f"{len(secret_files)} secret-bearing file(s) not gitignored (e.g. {secret_files[0]['path']}).")
         if n_conflicts:
-            sc -= 50
+            sc = 0
             sc_reasons.append(f"{n_conflicts} unmerged/conflicted path(s).")
         if untracked_junk:
             sc -= 25
             _jn = ", ".join(f["path"] for f in untracked_junk[:3])
             _jm = f" +{len(untracked_junk) - 3} more" if len(untracked_junk) > 3 else ""
-            sc_reasons.append(f"{len(untracked_junk)} build/artifact path(s) not gitignored: {_jn}{_jm}.")
+            sc_reasons.append(f"{len(untracked_junk)} possible artifact path(s), review origin before committing: {_jn}{_jm}.")
         if large_files:
-            sc -= 20
+            sc = min(sc - 21, 79)
             _lg = ", ".join(f"{f['path']} ({human_size(f.get('size', 0))})" for f in large_files[:3])
             _lm = f" +{len(large_files) - 3} more" if len(large_files) > 3 else ""
             sc_reasons.append(f"{len(large_files)} large file(s) - will bloat history: {_lg}{_lm}.")
@@ -913,58 +842,118 @@ def compute_scores(state: dict) -> dict:
             sc -= 15
             sc_reasons.append("Very large changeset (>200 files) - possible accidental `git add -A`.")
         if sc == 100:
-            sc_reasons.append("Changes look like normal source edits - safe to commit.")
+            sc_reasons.append("No detected structural commit hazards; review only the intended staged paths.")
+    if protected:
+        sc = 0
+        sc_reasons.append("Protected local-data/key filename(s) must not be committed: "
+                          + ", ".join(repr(f["path"]) for f in protected[:5]))
+    if any(f.get("huge") for f in recorded_files):
+        sc = min(sc, 39)
+    if state.get("index_locked") or state.get("active_operations"):
+        sc = 0
+        sc_reasons.append("Index lock or Git operation in progress; resolve its intended workflow first.")
+    if st.get("detached"):
+        sc = 0
+        sc_reasons.append("Detached HEAD has no durable branch destination; retain work on a named branch first.")
     sc = max(0, min(100, sc))
 
-    # ---- Safe Delete % : safe to discard the dirty tree? --------------------
-    # high = junk/recoverable -> nuke away;  low = precious unsaved work
+    # Discard summary only. Exact operation verdicts below supply safety evidence.
     sd = 100
     sd_reasons = []
     if not has_dirty:
         sd = 100
-        sd_reasons.append("Working tree is clean - nothing would be lost.")
+        sd_reasons.append("No ordinary working-tree changes detected; not blanket reset/clean/stash approval.")
     else:
-        if untracked_new:
+        if n_untracked:
             # Never-committed work is unrecoverable, so this must land BELOW the
             # CAUTION/STOP boundary (40), not exactly on it. A flat -60 from 100
             # scored 40 and read as OK_TO_DISCARD to the MCP client.
             sd = min(sd - 60, 39)
-            sd_reasons.append(f"{len(untracked_new)} new untracked file(s) would be PERMANENTLY lost (never committed).")
+            sd_reasons.append(f"{n_untracked} untracked path(s) lack a proven durable copy; cleaning may permanently lose work.")
+        if n_conflicts:
+            sd = min(sd, 39)
+            sd_reasons.append(
+                f"{n_conflicts} unmerged/conflicted path(s) would be destroyed by "
+                f"checkout/reset; discard is not approved.")
+        if n_staged:
+            sd = min(sd - 30, 39)
+            sd_reasons.append(
+                f"{n_staged} staged change(s) are unsaved index work and would be "
+                f"discarded; checkout/reset/clean are not authorized.")
         if n_modified:
-            sd -= 30
+            sd = min(sd - 30, 39)
             sd_reasons.append(f"{n_modified} tracked file(s) have uncommitted edits that would be discarded.")
-        if n_staged and not n_modified:
-            sd -= 15
-            sd_reasons.append(f"{n_staged} staged change(s) would be discarded.")
-        if unpushed:
-            sd -= 10
-            sd_reasons.append(f"{len(unpushed)} local commit(s) not on remote - active unsaved-to-remote work present.")
-        if untracked_junk and not untracked_new and not n_modified and not n_staged:
-            sd_reasons.append("Only build artifacts are dirty - safe to `git clean`.")
+    pending = max(len(unpushed), st.get("ahead") or 0)
+    if pending:
+        sd = min(sd, 39)
+        unpreserved.append("unpushed_commits")
+        sd_reasons.append(f"{pending} commit(s) ahead of the local upstream ref; resetting to it removes branch work.")
+    if state.get("local_commits_without_upstream"):
+        sd = min(sd, 39)
+        sd_reasons.append("Local commits have no upstream recovery evidence; zero ahead does not mean published.")
+    if state.get("ignored_count"):
+        sd = min(sd, 39)
+        unpreserved.append("ignored_paths")
+        sd_reasons.append(f"{state['ignored_count']} ignored path(s) are outside ordinary status and vulnerable to ignored-file cleaning.")
+    if state.get("index_inventory", {}).get("hidden_paths"):
+        sd = 0
+        unpreserved.append("status_hidden_paths")
+        sd_reasons.append("Index flags can hide working-tree edits; tracked discard is not proven safe.")
+    if state.get("side_branches") or st.get("detached"):
+        sd = min(sd, 39)
+        sd_reasons.append("Side-branch or detached work requires target-specific preservation evidence.")
+    if state.get("index_locked") or state.get("active_operations"):
+        sd = 0
+        sd_reasons.append("Index lock or Git operation in progress; preserve its state.")
 
     # stash triage (#2) - stashes survive `git clean`/`checkout`, but they hide work
     summ = state.get("stash_summary", {})
-    if summ.get("count"):
+    inspect_incomplete = bool(
+        summ.get("unknown")
+        or summ.get("uninspected")
+        or summ.get("error")
+        or summ.get("inspection_complete") is False
+    )
+    if summ.get("error") or summ.get("count"):
+        sd = min(sd, 39)
+        unpreserved.append("stashes")
         parts = []
         if summ.get("unmerged"):
             parts.append(f"{summ['unmerged']} unmerged (PRESERVE before dropping)")
         if summ.get("superseded"):
-            parts.append(f"{summ['superseded']} superseded/already-in-HEAD")
+            parts.append(f"{summ['superseded']} superseded (already in the working tree)")
         if summ.get("empty"):
             parts.append(f"{summ['empty']} empty")
-        detail = "; ".join(parts) if parts else str(summ["count"])
+        if summ.get("unknown"):
+            parts.append(f"{summ['unknown']} unknown (inspection failed)")
+        if summ.get("uninspected"):
+            parts.append(f"{summ['uninspected']} uninspected")
+        n_txt = "?" if summ.get("count") is None else str(summ.get("count"))
+        detail = "; ".join(parts) if parts else n_txt
         if summ.get("unmerged"):
             sd_reasons.append(
-                f"{summ['count']} stash(es) [{detail}] - {summ['unmerged']} hold work not "
-                f"cleanly in HEAD; archive/apply before clearing stashes.")
+                f"{n_txt} stash(es) [{detail}] - {summ['unmerged']} hold work not "
+                f"cleanly in the working tree; archive/apply before clearing stashes.")
+        elif inspect_incomplete:
+            sd_reasons.append(
+                f"{n_txt} stash(es) [{detail}] - inspection is incomplete or unknown; "
+                f"do not drop these stashes.")
         else:
             sd_reasons.append(
-                f"{summ['count']} stash(es) [{detail}] - none hold unique work; safe to clear.")
-    sd = max(0, min(100, sd))
+                f"{n_txt} stash(es) [{detail}] - working-tree presence is not durable recovery; "
+                "retain until the selected stash has committed-copy evidence.")
+    elif inspect_incomplete:
+        sd = 0
+        sd_reasons.append("Stash inventory is incomplete; preserve it.")
+    # Backward-safe migration: old clients that only understand score >= 80 or
+    # band GO must never interpret a generic snapshot as blanket deletion permission.
+    sd = max(0, min(79, sd))
+    sd_reasons.append("Choose an exact operation; this legacy summary never authorizes discard.")
 
     # topology (#3) - loud, unmissable warning if this path is not its own repo
     topo = state.get("topology", {})
     if topo.get("kind") == "tracked_inside_parent":
+        sc = sd = 0
         warn = "[TOPOLOGY] " + topo.get(
             "note", "This path is tracked inside a parent repo; results reflect the parent.")
         sc_reasons.insert(0, warn)
@@ -973,23 +962,230 @@ def compute_scores(state: dict) -> dict:
     return {
         "safe_commit": sc,
         "safe_commit_band": verdict_band(sc),
-        "safe_commit_label": "SAFE TO COMMIT" if sc >= 80 else ("REVIEW BEFORE COMMIT" if sc >= 40 else "DO NOT COMMIT"),
+        "safe_commit_label": ("INDEX CHECKS PASS" if n_staged else "NOTHING STAGED - PREVIEW") if sc >= 80 else ("REVIEW BEFORE COMMIT" if sc >= 40 else "DO NOT COMMIT"),
         "safe_commit_reasons": sc_reasons,
+        "safe_commit_scope": "index" if n_staged else "working_tree_preview",
         "safe_delete": sd,
         "safe_delete_band": verdict_band(sd),
-        "safe_delete_label": "SAFE TO DISCARD" if sd >= 80 else ("CAUTION - REVIEW FIRST" if sd >= 40 else "DO NOT DISCARD - UNSAVED WORK"),
+        "safe_delete_label": "EXPLICIT OPERATION REQUIRED" if sd >= 40 else "DO NOT DISCARD - PRESERVE WORK",
         "safe_delete_reasons": sd_reasons,
+        "safe_delete_scope": "summary_only",
+        "safe_delete_authorizes_action": False,
+        "unpreserved_work": unpreserved,
     }
+
+
+# ----------------------------------------------------------------------------
+# operation-specific safety evidence (read-only; never performs the operation)
+# ----------------------------------------------------------------------------
+ACTION_SCOPES = {
+    "commit_index": "git commit of the inspected index (not -a, path arguments, or amend)",
+    "discard_tracked": "git restore --worktree -- . (from the index; no submodule recursion)",
+    "clean_untracked": "git clean -fd (not -x, -X, or a second -f)",
+    "clean_ignored": "git clean -fdx (not a second -f)",
+    "reset_hard": "git reset --hard <resolved target OID> (no submodule recursion)",
+    "drop_stash": "git stash drop <selected stash ref> with committed-copy proof",
+}
+
+
+def assess_action(state: dict, operation: str | None, target: str | None = None) -> dict:
+    """Hard preservation predicates. A summary score is never action approval."""
+    st = state.get("status") or {}
+    reasons = []
+    resolved_target = None
+    if operation not in ACTION_SCOPES:
+        reasons.append("An explicit supported operation is required; no blanket discard approval exists.")
+    if (state.get("schema_version") != SCHEMA_VERSION or state.get("is_repo") is not True
+            or state.get("read_complete") is not True or state.get("read_errors")
+            or st.get("ok") is not True or st.get("complete") is not True):
+        reasons.append("Required Git evidence is missing, failed, or incomplete.")
+    if state.get("topology", {}).get("kind") != "own_repo":
+        reasons.append("Request the actual repository root; this path has ambiguous action scope.")
+    if state.get("index_locked") or state.get("active_operations"):
+        reasons.append("An index lock or unfinished Git operation requires reconciliation first.")
+    if operation not in ("reset_hard", "drop_stash") and target is not None:
+        reasons.append("This operation does not accept a target.")
+    if not reasons:
+        hidden = state.get("index_inventory", {}).get("hidden_paths")
+        if operation == "commit_index":
+            scores = state.get("scores") or {}
+            if not st.get("staged"):
+                reasons.append("No staged changes; this is a preview, not a commit approval.")
+            if scores.get("safe_commit_band") != "GO" or scores.get("safe_commit", 0) < 80:
+                reasons.extend(scores.get("safe_commit_reasons") or ["Commit hazards require review."])
+        elif operation in ("clean_untracked", "clean_ignored"):
+            if state.get("untracked_inventory") or st.get("untracked"):
+                reasons.append("Untracked paths have no proven durable copy, regardless of names or extensions.")
+            if operation == "clean_ignored" and state.get("ignored_count"):
+                reasons.append("Ignored paths have no proven durable copy; ignored does not mean disposable.")
+        elif operation == "discard_tracked":
+            if st.get("modified") or st.get("conflicts") or hidden:
+                reasons.append("Working-tree edits, conflicts, or status-hidden paths would not be safely preserved.")
+        elif operation == "reset_hard":
+            if not target:
+                reasons.append("Reset requires an explicit target; a clean tree says nothing about another commit.")
+            elif not state.get("has_commits"):
+                reasons.append("No current HEAD commit to compare with the target.")
+            else:
+                repo = GitRepo(state["root"])
+                out, rc, _ = repo._run("rev-parse", "--verify", "--end-of-options", target + "^{commit}")
+                if rc or not re.fullmatch(r"[0-9a-f]{40,64}", out.strip()):
+                    reasons.append("Reset target cannot be resolved to a commit.")
+                else:
+                    resolved_target = out.strip()
+                    _, ancestor_rc, _ = repo._run("merge-base", "--is-ancestor", st["oid"], resolved_target)
+                    if ancestor_rc:
+                        reasons.append("The target does not preserve current HEAD ancestry, or ancestry could not be proven.")
+                    if resolved_target != st["oid"] and (state.get("untracked_inventory") or st.get("untracked") or state.get("ignored_count")):
+                        reasons.append("A different target may overwrite untracked/ignored paths; collision-free recovery is unproven.")
+                    current, current_rc, _ = repo._run("rev-parse", "--verify", "HEAD")
+                    if current_rc or current.strip() != st["oid"]:
+                        reasons.append("HEAD changed during target inspection; refresh.")
+            if st.get("staged") or st.get("modified") or st.get("conflicts") or hidden:
+                reasons.append("Reset would discard index/worktree changes or status-hidden work.")
+        elif operation == "drop_stash":
+            proof = stash_committed_copy(state, target)
+            resolved_target = proof.get("stash_oid")
+            if not proof["safe"]:
+                reasons.extend(proof["reasons"])
+    safe = not reasons
+    return {
+        "operation": operation, "target": target, "resolved_target": resolved_target,
+        "scope": ACTION_SCOPES.get(operation, "unsupported or unspecified"),
+        "safe": safe, "decision": "ALLOW" if safe else "BLOCK",
+        "reasons": reasons or ["No detected data-loss hazard within this exact operation's scope."],
+        "root": state.get("root"), "head_oid": st.get("oid"),
+        "index_fingerprint": state.get("index_inventory", {}).get("fingerprint"),
+        "publication_id": state.get("publication_id"),
+        "limits": "Snapshot evidence, not execution authorization, a backup, a secret scan, or protection against future concurrent writes.",
+    }
+
+
+def stash_committed_copy(state: dict, target: str | None) -> dict:
+    """Prove selected stash deltas are durably present in the current branch.
+
+    Compare tree metadata (mode + blob IDs), never scan content. Both the saved
+    index and working tree matter, as does the optional untracked parent. A
+    merely reverse-applicable patch or a working-tree copy proves nothing here.
+    """
+    reasons = []
+    st = state.get("status") or {}
+    if not target or not re.fullmatch(r"stash@\{[0-9]+\}", target):
+        return {"safe": False, "reasons": ["Select one exact stash ref; blanket clearing is not supported."]}
+    if not state.get("has_commits") or st.get("detached") or not st.get("branch"):
+        return {"safe": False, "reasons": ["A retained current branch commit is required for stash recovery proof."]}
+    repo = GitRepo(state["root"])
+    out, rc, _ = repo._required("rev-parse", "--verify", "--end-of-options", target + "^{commit}")
+    stash_oid = out.strip()
+    if rc or not re.fullmatch(r"[0-9a-f]{40,64}", stash_oid):
+        return {"safe": False, "reasons": ["Selected stash cannot be resolved."]}
+    out, rc, _ = repo._required("rev-list", "--parents", "-n", "1", stash_oid)
+    parents = out.split()[1:]
+    if rc or len(parents) not in (2, 3):
+        return {"safe": False, "reasons": ["Selected object has no verified stash parent structure."]}
+    # A reflog entry can point at a crafted merge, not a canonical Git stash.
+    # Inspect raw commit headers: rev-list alone can conceal side ancestry.
+    def raw_parents(oid):
+        raw, code, _ = repo._required("cat-file", "-p", oid)
+        if code:
+            return None
+        header = raw.partition("\n\n")[0]
+        return [line[7:] for line in header.splitlines() if line.startswith("parent ")]
+
+    if raw_parents(stash_oid) != parents or raw_parents(parents[1]) != [parents[0]]:
+        return {"safe": False, "reasons": ["Noncanonical stash/index ancestry may retain additional work; preserve it."]}
+    if len(parents) == 3 and raw_parents(parents[2]) != []:
+        return {"safe": False, "reasons": ["Noncanonical untracked-parent ancestry must be preserved."]}
+    _, rc, _ = repo._run("merge-base", "--is-ancestor", parents[0], st["oid"])
+    if rc:
+        reasons.append("The stash base is not proven retained in current branch history.")
+
+    def tree(oid):
+        out, rc, _ = repo._required("ls-tree", "-r", "-z", "--full-tree", oid)
+        entries = {}
+        for row in out.split("\0") if not rc else []:
+            if not row:
+                continue
+            meta, sep, path = row.partition("\t")
+            fields = meta.split()
+            if not sep or len(fields) != 3:
+                repo.read_errors.append("Malformed stash tree metadata")
+                continue
+            entries[path] = (fields[0], fields[1], fields[2])
+        return entries
+
+    base, head = tree(parents[0]), tree(st["oid"])
+    missing = set()
+    for variant in (tree(stash_oid), tree(parents[1])):
+        for path in base.keys() | variant.keys():
+            if variant.get(path) != base.get(path) and head.get(path) != variant.get(path):
+                missing.add(path)
+    if len(parents) == 3:
+        for path, entry in tree(parents[2]).items():
+            if head.get(path) != entry:
+                missing.add(path)
+    if missing:
+        reasons.append(f"{len(missing)} saved path version(s) are not proven present in HEAD; retain the stash.")
+    current, rc, _ = repo._required("rev-parse", "--verify", "HEAD")
+    selected, src, _ = repo._required("rev-parse", "--verify", "--end-of-options", target + "^{commit}")
+    if rc or src or current.strip() != st["oid"] or selected.strip() != stash_oid:
+        reasons.append("HEAD or the selected stash changed during proof; refresh.")
+    reasons.extend(repo.read_errors)
+    return {"safe": not reasons, "reasons": reasons,
+            "stash_oid": stash_oid, "retained_in_head": st["oid"],
+            "basis": "exact tree modes/object IDs for saved index, worktree, and untracked deltas"}
+
+
+def closeout_state(state: dict) -> dict:
+    st = state.get("status") or {}
+    counts = {
+        "dirty_file_count": len(state.get("files", [])),
+        "conflict_count": len(st.get("conflicts", [])),
+        "stash_count": len(state.get("stashes", [])),
+        "side_branch_count": len(state.get("side_branches", [])),
+        "extra_worktree_count": state.get("extra_worktree_count"),
+        "unpushed_commit_count": state.get("unpushed_commit_count"),
+    }
+    remaining = [name for name, value in counts.items() if value != 0]
+    if st.get("branch") != "main" or st.get("detached"):
+        remaining.append("not_on_main")
+    if state.get("main_equals_origin_main") is not True:
+        remaining.append("main_not_verified_equal_to_origin_main")
+    if state.get("index_inventory", {}).get("hidden_paths"):
+        remaining.append("status_hidden_paths")
+    if state.get("active_operations") or state.get("index_locked"):
+        remaining.append("git_operation_in_progress")
+    complete = (state.get("read_complete") is True and state.get("is_repo") is True
+                and state.get("topology", {}).get("kind") == "own_repo")
+    return {**counts, "status": ("BLOCKED" if not complete else
+                                 "RECONCILE" if remaining else "LOCAL_STATE_COMPLETE"),
+            "local_state_complete": complete and not remaining,
+            "remaining": remaining, "remote_verified": False,
+            "basis": "Local refs only; remote synchronization must be established by the requested delivery workflow."}
 
 
 # ----------------------------------------------------------------------------
 # state builder
 # ----------------------------------------------------------------------------
 def build_state(repo: GitRepo, config: dict) -> dict:
+    started = time.perf_counter()
+    repo.read_errors = []
+    try:
+        with open(__file__, "rb") as fh:
+            if hashlib.sha256(fh.read()).hexdigest() != ENGINE_SOURCE_SHA256:
+                repo.read_errors.append("GIT_REAL source changed after this process started; reconnect/restart it.")
+    except OSError:
+        repo.read_errors.append("Loaded GIT_REAL source cannot be verified")
     root = repo.root
     now = datetime.now(timezone.utc).astimezone()
     state = {
         "version": VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "engine_source_sha256": ENGINE_SOURCE_SHA256,
+        "publication_id": os.urandom(16).hex(),
+        "request_id": config.get("request_id"),
+        "secret_scan_state": "SKIPPED_BY_OWNER_POLICY",
+        "remote_verification": "LOCAL_TRACKING_REFS_ONLY",
         "generated_at": now.isoformat(timespec="seconds"),
         "generated_at_human": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "root": root,
@@ -1003,22 +1199,24 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         "branches": [], "default_branch": None, "side_branches": [],
         "ignored": [], "ignored_count": 0,
         "unpushed": [], "stashes": [], "remotes": [], "last_commit": None,
-        "secrets": [],
-        "scan": {"scanned": 0, "candidates": 0, "unscanned": 0,
-                 "truncated": False, "limit": MAX_SCAN_FILES},
-        "history_incidents": [], "secrets_in_history": 0,
-        "history_checked": False, "history_truncated": False,
         "gitignore_suggestions": [],
         "scores": {},
         "topology": {"kind": "unknown", "toplevel": None},
         "stashes_detail": [],
-        "stash_summary": {"count": 0, "empty": 0, "superseded": 0, "unmerged": 0},
+        "stash_summary": {
+            "count": 0, "empty": 0, "superseded": 0, "unmerged": 0,
+            "unknown": 0, "inspected": 0, "uninspected": 0,
+            "inspection_complete": True,
+        },
+        "read_complete": True,
+        "read_errors": [],
         "remotes_detail": [],
         "push_weight": {},
-        "muted_secret_files": config.get("muted_secret_files", []),
     }
 
     if not state["is_repo"]:
+        state["read_complete"] = False
+        state["read_errors"] = ["Not a readable Git working tree"]
         state["topology"] = {
             "kind": "untracked",
             "toplevel": None,
@@ -1043,30 +1241,102 @@ def build_state(repo: GitRepo, config: dict) -> dict:
             "note": (f"'{state['root_name']}' is NOT its own git repo - it is tracked "
                      f"inside {top}. git commands run here operate on that PARENT repo, "
                      f"so every field below reflects the parent, not this folder. "
-                     f"Half-extracted standalone: `git init` here to split it out."),
+                     "Request the actual repository root before a Git action."),
         }
+        parent = build_state(GitRepo(top), config)
+        parent["requested_root"] = root
+        parent["topology"] = state["topology"]
+        parent["scores"] = compute_scores(parent)
+        parent["actions"] = {name: assess_action(parent, name) for name in parent.get("actions", {})}
+        parent["closeout"] = closeout_state(parent)
+        return parent
     else:
         state["topology"] = {"kind": "own_repo", "toplevel": top or root}
+    if not top:
+        repo.read_errors.append("Repository root could not be resolved")
+    # Hooks legitimately export the default index/repository paths. Accept those
+    # exact paths, but do not silently inspect a different index or repository.
+    gitdir = os.path.join(root, ".git")
+    if os.path.isfile(gitdir):
+        try:
+            with open(gitdir, encoding="utf-8") as fh:
+                link = fh.readline().rstrip("\n")
+            if not link.startswith("gitdir: "):
+                raise ValueError("not a gitfile")
+            gitdir = os.path.abspath(os.path.join(root, link[8:]))
+        except (OSError, ValueError):
+            repo.read_errors.append("Linked worktree gitdir could not be resolved")
+    expected = {"GIT_DIR": gitdir, "GIT_WORK_TREE": root,
+                "GIT_INDEX_FILE": os.path.join(gitdir, "index")}
+    redirected = []
+    for key, destination in expected.items():
+        value = os.environ.get(key)
+        if value and os.path.normcase(os.path.realpath(os.path.join(root, value))) != os.path.normcase(os.path.realpath(destination)):
+            redirected.append(key)
+    redirected.extend(k for k in ("GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE") if os.environ.get(k))
+    if redirected:
+        repo.read_errors.append("Git environment redirects repository/index scope: " + ", ".join(redirected))
 
-    state["has_commits"] = repo.has_commits()
     st = repo.status()
+    state["has_commits"] = bool(st.get("oid") and st["oid"] != "(initial)")
     state["status"] = st
+    if st.get("ok") is False or st.get("complete") is False:
+        state["read_complete"] = False
+        state["read_errors"] = [st.get("error") or "git status failed"]
     state["remotes"] = repo.remotes()
     state["last_commit"] = repo.last_commit()
     state["stashes"] = repo.stashes()
-    state["unpushed"] = repo.unpushed_commits(has_upstream=bool(st["upstream"]))
+    state["unpushed"] = repo.unpushed_commits(has_upstream=bool(st.get("upstream")))
+    state["local_commits_without_upstream"] = state["has_commits"] and not st.get("upstream")
+    state["unpushed_commit_count"] = st.get("ahead") if st.get("ahead_behind_known") else None
+    if not state["has_commits"]:
+        state["unpushed_commit_count"] = 0
+    if st.get("upstream") and not st.get("ahead_behind_known"):
+        repo.read_errors.append("Upstream comparison is missing or unavailable")
+    state["index_inventory"] = repo.index_inventory()
+    state["worktrees"] = repo.worktrees()
+    state["extra_worktree_count"] = max(0, len(state["worktrees"]) - 1)
+    state["stale_worktree_count"] = sum(bool(w.get("prunable")) for w in state["worktrees"])
+    state.update(repo.operation_markers())
+    refs = repo.refs_inventory()
+    if bool(refs.get("refs/stash")) != bool(state["stashes"]):
+        repo.read_errors.append("Stash ref and reflog inventory disagree; hidden stash work must be preserved.")
+    overlays = [name for name in refs if name.startswith("refs/replace/")]
+    graft_path, graft_rc, _ = repo._required("rev-parse", "--git-path", "info/grafts")
+    if not graft_rc and os.path.lexists(os.path.join(root, graft_path.rstrip("\n"))):
+        overlays.append("info/grafts")
+    state["history_overlays"] = overlays
+    if overlays:
+        repo.read_errors.append("Replacement refs or grafts make history-based recovery unproven; remove that ambiguity before acting.")
+    state["upstream_is_remote_tracking_ref"] = bool(st.get("upstream") and "refs/remotes/" + st["upstream"] in refs)
+    if state["has_commits"] and not state["upstream_is_remote_tracking_ref"]:
+        state["local_commits_without_upstream"] = True
+        state["unpushed_commit_count"] = None
+    state["branch_ahead_commit_count"] = st.get("ahead") if st.get("ahead_behind_known") else None
+    state["unpushed_count_scope"] = "All locally referenced commits (including tags/custom refs/worktrees), absent from all local remote-tracking refs"
+    if any(name.startswith("refs/remotes/") for name in refs):
+        count, count_rc, _ = repo._required("rev-list", "--count", "--all", "--not", "--remotes")
+        if not count_rc and count.strip().isdigit():
+            state["unpushed_commit_count"] = int(count.strip())
+        else:
+            state["unpushed_commit_count"] = None
+            repo.read_errors.append("Local-ref commit coverage could not be counted")
+    state["main_oid"] = refs.get("refs/heads/main")
+    state["origin_main_oid"] = refs.get("refs/remotes/origin/main")
+    state["main_equals_origin_main"] = (
+        state["main_oid"] == state["origin_main_oid"]
+        if state["main_oid"] and state["origin_main_oid"] else None)
 
     # stash triage (#2): dead/superseded vs unmerged work hiding in stashes
-    sdet = repo.stash_details()
+    sdet = [] if config.get("quick") else repo.stash_details()
     state["stashes_detail"] = sdet
-    state["stash_summary"] = {
-        "count": len(sdet),
-        "empty": sum(1 for s in sdet if s["verdict"] == "empty"),
-        "superseded": sum(1 for s in sdet if s["verdict"] == "superseded"),
-        "unmerged": sum(1 for s in sdet if s["verdict"] == "unmerged"),
-    }
+    state["stash_summary"] = summarize_stashes(state["stashes"], sdet)
+    if state["stash_summary"].get("inspection_complete") is False:
+        err = state["stash_summary"].get("error")
+        if err:
+            state["read_errors"] = list(state.get("read_errors") or []) + [err]
 
-    # remote identity (#5): which account/key each push authenticates as
+    # Remote URL / basic SSH configuration hints; no authentication occurs here.
     rdetail = []
     for rn in state["remotes"]:
         ident = resolve_remote_identity(repo.remote_url(rn) or "")
@@ -1075,8 +1345,8 @@ def build_state(repo: GitRepo, config: dict) -> dict:
     state["remotes_detail"] = rdetail
 
     # push weight (#6): pack size + largest tracked blobs -> know a slow/heavy push first
-    pack = repo.pack_size_bytes()
-    blobs = repo.largest_tracked_blobs(5)
+    pack = None if config.get("quick") else repo.pack_size_bytes()
+    blobs = [] if config.get("quick") else repo.largest_tracked_blobs(5)
     heavy_blobs = [b for b in blobs if b["size"] >= LARGE_FILE_WARN]
     state["push_weight"] = {
         "pack_bytes": pack,
@@ -1085,7 +1355,8 @@ def build_state(repo: GitRepo, config: dict) -> dict:
             {"path": b["path"], "size": b["size"], "human": human_size(b["size"])}
             for b in blobs
         ],
-        "heavy": bool(heavy_blobs) or pack >= 100_000_000,
+        "assessed": not config.get("quick", False),
+        "heavy": (bool(heavy_blobs) or pack >= 100_000_000) if pack is not None else None,
         "heavy_note": (
             f"{human_size(pack)} of objects; heavy tracked files: "
             + ", ".join(f"{b['path']} ({human_size(b['size'])})" for b in heavy_blobs[:3])
@@ -1104,20 +1375,23 @@ def build_state(repo: GitRepo, config: dict) -> dict:
             continue
         b2 = dict(b)
         b2["merged_into_default"] = b["name"] in merged if default else None
-        b2["pushed"] = b["upstream"] is not None
+        b2["pushed"] = bool(b["upstream"] and "refs/remotes/" + b["upstream"] in refs
+                            and not re.search(r"ahead|gone", b["track"]))
+        b2["pushed_basis"] = "local_tracking_ref_only"
         side.append(b2)
     state["side_branches"] = side
 
     # ignored
     ignored = repo.ignored_entries()
+    state["untracked_inventory"] = repo.untracked_entries()
     state["ignored"] = ignored[:500]
     state["ignored_count"] = len(ignored)
-    ignored_set = set(ignored)
 
-    # assemble files list (dirty/staged/untracked/conflict) + classify + scan
+    # Assemble the dirty/staged/untracked/conflict file list. Ordinary status
+    # deliberately does not inspect file bytes for secrets.
     files = []
     seen = set()
-    muted = set(config.get("muted_secret_files", []))
+    staged_sizes = repo.staged_blob_sizes(st["staged"])
 
     def add_file(path, category, **extra):
         if path in seen:
@@ -1128,23 +1402,33 @@ def build_state(repo: GitRepo, config: dict) -> dict:
                     return
         seen.add(path)
         full = os.path.join(root, path.rstrip("/"))
-        size = None
+        working_size = None
         try:
-            if os.path.isfile(full):
-                size = os.path.getsize(full)
-        except Exception:  # noqa: BLE001
-            pass
+            info = os.lstat(full)
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                working_size = info.st_size
+        except FileNotFoundError:
+            if category in ("new", "junk"):
+                repo.read_errors.append("An untracked path disappeared during inventory")
+        except OSError:
+            repo.read_errors.append("A working path could not be inspected")
+        staged_size = staged_sizes.get(extra.get("oid")) if category == "staged" else None
+        # A staged Git LFS asset is a small pointer in the index and an expanded
+        # payload in the working tree. Commit risk must measure what Git will
+        # actually record, while retaining the working size for visibility.
+        size = staged_size if staged_size is not None else working_size
         entry = {
             "path": path, "category": category, "size": size,
+            "working_size": working_size, "staged_size": staged_size,
             "large": bool(size and size >= LARGE_FILE_WARN),
             "huge": bool(size and size >= LARGE_FILE_CRIT),
-            "secret_filename": is_secret_filename(path) and path not in ignored_set and path not in muted,
+            "artifact_candidate": artifact_hint(path),
         }
         entry.update(extra)
         files.append(entry)
 
     for s in st["staged"]:
-        add_file(s["path"], "staged", staged=True, x=s.get("x"))
+        add_file(s["path"], "staged", staged=True, x=s.get("x"), mode=s.get("mode"), oid=s.get("oid"))
     for m in st["modified"]:
         add_file(m["path"], "modified", modified=True, y=m.get("y"))
     for c in st["conflicts"]:
@@ -1153,54 +1437,14 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         cat = classify_untracked(root, u)
         add_file(u, cat, untracked=True)
 
-    # secret content scan (bounded) over text-ish, non-junk-dir files
-    allow_globs = load_secret_allowlist(root, config)
-    candidates = [f for f in files
-                  if not f["path"].endswith("/")
-                  and f["path"] not in muted
-                  and f["category"] != "junk"]
-    secrets = []
-    scanned = 0
-    scan_truncated = False
-    for f in candidates:
-        if scanned >= MAX_SCAN_FILES:
-            scan_truncated = True            # cap hit: files past here are UNSCANNED
-            break
-        found = scan_file_for_secrets(root, f["path"], allow_globs=allow_globs)
-        scanned += 1
-        if found:
-            f["has_secret"] = True
-            secrets.extend(found)
-    state["secrets"] = secrets
     state["files"] = files
-    state["scan"] = {
-        "scanned": scanned, "candidates": len(candidates),
-        "unscanned": max(0, len(candidates) - scanned),
-        "truncated": scan_truncated, "limit": MAX_SCAN_FILES,
-    }
 
-    # secret-in-history: distinguish "caught in time" from "already committed" (an incident).
-    # Walk the FULL commit graph so a committed-then-DELETED secret is still caught - a
-    # current-tree / tracked-blob scan alone reports those clean (the old blind spot).
-    if config.get("check_history") and state["has_commits"]:
-        incidents, hist_truncated = scan_history_for_secrets(root, allow_globs)
-        state["history_incidents"] = incidents
-        state["history_truncated"] = hist_truncated
-        hist_keys = {(i["type"], i["masked"]) for i in incidents}
-        for sfd in secrets:                                    # badge still-present findings
-            if (sfd["type"], sfd["masked"]) in hist_keys:
-                sfd["in_history"] = True
-    else:
-        state["history_incidents"] = []
-        state["history_truncated"] = False
-    state["secrets_in_history"] = len(state["history_incidents"])
-    state["history_checked"] = bool(config.get("check_history"))
 
     # gitignore suggestions: junk present and not already ignored
     suggestions = []
     present = set()
     for f in files:
-        if f["category"] != "junk":
+        if not f.get("untracked") or not f.get("artifact_candidate"):
             continue
         base = f["path"].rstrip("/").split("/")[-1]
         # find a suggestion key contained in the path
@@ -1210,16 +1454,37 @@ def build_state(repo: GitRepo, config: dict) -> dict:
                     suggestions.append({"pattern": pat, "reason": f"untracked {f['path']}"})
                     present.add(pat)
                 break
-    # also suggest ignoring secret files
-    for f in files:
-        if f.get("secret_filename"):
-            base = f["path"].rstrip("/").split("/")[-1]
-            if base not in present and base not in _read_gitignore_lines(root):
-                suggestions.append({"pattern": base, "reason": f"secret-bearing file {f['path']}", "secret": True})
-                present.add(base)
     state["gitignore_suggestions"] = suggestions
 
+    # Recheck the observed state so an intervening Git edit is not silently mixed
+    # into a snapshot. This detects changes during inspection, not future writers.
+    if repo.status() != st:
+        repo.read_errors.append("Git status changed during inspection; refresh before acting")
+    if repo.refs_inventory() != refs:
+        repo.read_errors.append("Git refs changed during inspection; refresh before acting")
+    if repo.index_inventory()["fingerprint"] != state["index_inventory"]["fingerprint"]:
+        repo.read_errors.append("Git index changed during inspection; refresh before acting")
+    if repo.ignored_entries() != ignored:
+        repo.read_errors.append("Ignored paths changed during inspection; refresh before acting")
+    if repo.untracked_entries() != state["untracked_inventory"]:
+        repo.read_errors.append("Untracked paths changed during inspection; refresh before acting")
+    if repo.stashes() != state["stashes"]:
+        repo.read_errors.append("Stash inventory changed during inspection; refresh before acting")
+    if repo.worktrees() != state["worktrees"]:
+        repo.read_errors.append("Worktree inventory changed during inspection; refresh before acting")
+    markers = repo.operation_markers()
+    if any(state[key] != value for key, value in markers.items()):
+        repo.read_errors.append("Git operation state changed during inspection; refresh before acting")
+    if repo.status() != st:
+        repo.read_errors.append("Working-tree state changed at the final observation; refresh before acting")
+    state["consistency"] = "Repeated metadata observations, not an atomic filesystem snapshot or a lock on future writers."
+    state["read_errors"] = list(dict.fromkeys(state["read_errors"] + repo.read_errors))
+    state["read_complete"] = bool(state["read_complete"] and not state["read_errors"])
     state["scores"] = compute_scores(state)
+    state["actions"] = {name: assess_action(state, name) for name in (
+        "commit_index", "discard_tracked", "clean_untracked", "clean_ignored")}
+    state["closeout"] = closeout_state(state)
+    state["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
     return state
 
 
@@ -1236,7 +1501,9 @@ def _read_gitignore_lines(root: str) -> set[str]:
 
 def add_to_gitignore(root: str, pattern: str) -> bool:
     pattern = pattern.strip()
-    if not pattern:
+    if not pattern or any(c in pattern for c in ("\n", "\r", "\0")):
+        return False
+    if os.path.islink(os.path.join(root, ".gitignore")):
         return False
     existing = _read_gitignore_lines(root)
     if pattern in existing:
@@ -1524,24 +1791,12 @@ function reactorLoop(now){
 function render(){
   const s=STATE, sc=s.scores||{};
   document.getElementById('rootpath').textContent=s.root||'';
-  document.getElementById('commitcard').innerHTML=reactorCard('Safe to Commit',sc.safe_commit,sc.safe_commit_band,sc.safe_commit_label,sc.safe_commit_reasons,'agents read this before they commit');
+  document.getElementById('commitcard').innerHTML=reactorCard('Commit review',sc.safe_commit,sc.safe_commit_band,sc.safe_commit_label,sc.safe_commit_reasons,'require actions.commit_index for the inspected index');
   mountReactor(sc.safe_commit_band);
-  document.getElementById('deletecard').innerHTML=scoreCard('Safe to Discard',sc.safe_delete,sc.safe_delete_band,sc.safe_delete_label,sc.safe_delete_reasons,'safe to nuke this dirty tree?');
+  document.getElementById('deletecard').innerHTML=scoreCard('Preservation summary',sc.safe_delete,sc.safe_delete_band,sc.safe_delete_label,sc.safe_delete_reasons,'never authorizes deletion; request the exact operation');
 
-  // alert
-  const secrets=s.secrets||[]; const secFiles=(s.files||[]).filter(f=>f.secret_filename);
-  const incidents=s.history_incidents||[];
+  // alert (secret-byte enforcement is intentionally outside ordinary status)
   let ab=document.getElementById('alertbox'); ab.innerHTML='';
-  if(secrets.length||secFiles.length){
-    const lines=[];
-    secrets.slice(0,6).forEach(x=>lines.push(`${esc(x.type)} in ${esc(x.file)}:${x.line} (${esc(x.masked)})${x.in_history?' <b style="color:#ff3b30">[IN HISTORY'+(x.history_commit?' @'+esc(x.history_commit):'')+']</b>':''}`));
-    secFiles.slice(0,4).forEach(f=>lines.push(`secret-bearing file not ignored: ${esc(f.path)}`));
-    const head=incidents.length
-      ? `INCIDENT - ${incidents.length} secret(s) ALREADY COMMITTED, rotate and scrub history`
-      : `SECRET ALERT - ${secrets.length+secFiles.length} finding(s)`;
-    ab.innerHTML=`<div class="alert clip"><span class="tri">&#9650;</span><div class="txt">
-      <b>${head}</b><br>${lines.join('<br>')}</div></div>`;
-  }
   // topology (#3): loud amber banner when this path is NOT its own repo
   const topo=s.topology||{};
   if(topo.kind==='tracked_inside_parent'){
@@ -1557,8 +1812,8 @@ function render(){
   const st=s.status||{};
   const branch=st.detached?'(detached HEAD)':(st.branch||'-');
   let bp='';
-  bp+=stat('Current branch',branch);
-  bp+=stat('Upstream',st.upstream||'<span class="caution">none set</span>');
+  bp+=stat('Current branch',esc(branch));
+  bp+=stat('Upstream',st.upstream?esc(st.upstream):'<span class="caution">none set</span>');
   bp+=stat('Ahead / Behind',`<span class="${st.ahead?'caution':''}">${st.ahead||0}</span> / <span class="${st.behind?'caution':''}">${st.behind||0}</span>`);
   bp+=stat('Unpushed commits',`<span class="${(s.unpushed||[]).length?'caution':'go'}">${(s.unpushed||[]).length}</span>`);
   document.getElementById('branchstat').innerHTML=bp;
@@ -1600,7 +1855,7 @@ function render(){
   } else {
     ms+=stat('Remotes','<span class="caution">none</span>');
   }
-  ms+=stat('Default branch',s.default_branch||'-');
+  ms+=stat('Default branch',esc(s.default_branch||'-'));
   ms+=stat('Side branches',`<span class="${(s.side_branches||[]).length?'caution':''}">${(s.side_branches||[]).length}</span>`);
   const pw=s.push_weight||{};
   if(pw.pack_human)ms+=stat('Repo size (push weight)',`<span class="${pw.heavy?'caution':''}">${esc(pw.pack_human)}${pw.heavy?' ⚠ heavy':''}</span>`);
@@ -1613,8 +1868,6 @@ function render(){
   if(!files.length){dl.innerHTML='<div class="empty">Clean working tree - nothing dirty.</div>';}
   else dl.innerHTML=files.map(f=>{
     let badges='';
-    if(f.has_secret)badges+='<span class="badge b-secret">SECRET</span>';
-    if(f.secret_filename)badges+='<span class="badge b-secret">!ENV</span>';
     const cat={staged:'b-staged',modified:'b-dirty',new:'b-new',junk:'b-junk',conflict:'b-conflict'}[f.category]||'b-dirty';
     const cname={staged:'STAGED',modified:'DIRTY',new:'NEW',junk:'JUNK',conflict:'CONFLICT'}[f.category]||'DIRTY';
     badges=`<span class="badge ${cat}">${cname}</span>`+badges;
@@ -1657,7 +1910,7 @@ function render(){
   il.innerHTML=ig.length?ig.map(p=>`<li><span class="badge b-junk">IGNORED</span><span class="fpath">${esc(p)}</span></li>`).join(''):'<div class="empty">Nothing ignored.</div>';
 
   document.getElementById('updated').textContent=s.generated_at_human||'';
-  document.getElementById('reposcope').textContent=`${esc(s.root_name||'')} · ${(s.files||[]).length} dirty · ${(s.secrets||[]).length} secrets · ${(s.side_branches||[]).length} side-branches`;
+  document.getElementById('reposcope').textContent=`${esc(s.root_name||'')} · ${(s.files||[]).length} dirty · ${(s.side_branches||[]).length} side-branches`;
   document.getElementById('setinterval').textContent=(__INTERVAL__)+'s';
   document.title=`GIT_REAL - ${s.root_name||''} (${(s.scores||{}).safe_commit||0}/${(s.scores||{}).safe_delete||0})`;
 }
@@ -1685,19 +1938,55 @@ refresh();
 </html>"""
 
 
+def json_for_script(obj) -> str:
+    """JSON safe to embed inside a <script> element (no raw HTML specials)."""
+    return (
+        json.dumps(obj, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def html_text(value) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
 def render_html(state: dict, port: int, interval: float) -> str:
-    html = HTML_TEMPLATE
-    html = html.replace("__STATE_JSON__", json.dumps(state))
-    html = html.replace("__PORT__", str(port))
-    html = html.replace("__INTERVAL__", str(interval))
-    html = html.replace("__VERSION__", VERSION)
-    html = html.replace("__ROOT_NAME__", state.get("root_name", "repo"))
-    return html
+    page = HTML_TEMPLATE
+    page = page.replace("__STATE_JSON__", json_for_script(state))
+    page = page.replace("__PORT__", str(port))
+    page = page.replace("__INTERVAL__", str(interval))
+    page = page.replace("__VERSION__", html_text(VERSION))
+    page = page.replace("__ROOT_NAME__", html_text(state.get("root_name", "repo")))
+    return page
 
 
 # ----------------------------------------------------------------------------
 # app state + output writing
 # ----------------------------------------------------------------------------
+def atomic_write_text(path: str, content: str):
+    """Publish a complete snapshot or raise; never report a stale file as fresh."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if os.path.islink(path) or os.path.islink(parent):
+        raise OSError("Refusing a symlinked GIT_REAL output destination")
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=parent,
+                                         prefix=".gitreal-", delete=False) as fh:
+            temp_path = fh.name
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            os.unlink(temp_path)  # Only our own unpublished temporary file.
+
+
 class App:
     def __init__(self, root: str, port: int, interval: float):
         self.repo = GitRepo(root)
@@ -1705,6 +1994,8 @@ class App:
         self.port = port
         self.interval = interval
         self.outdir = os.path.join(self.root, OUTPUT_DIRNAME)
+        if os.path.islink(self.outdir):
+            raise OSError("Refusing a symlinked GIT_REAL output directory")
         self.config = self._load_config()
         self.state = {}
         self.lock = threading.Lock()
@@ -1729,7 +2020,7 @@ class App:
                     return json.load(fh)
             except Exception:  # noqa: BLE001
                 pass
-        return {"muted_secret_files": []}
+        return {}
 
     def _save_config(self):
         try:
@@ -1745,13 +2036,11 @@ class App:
             return self.state
 
     def _write_outputs(self):
-        try:
-            with open(os.path.join(self.outdir, "git-real.json"), "w") as fh:
-                json.dump(self.state, fh, indent=2)
-            with open(os.path.join(self.outdir, "git-real.html"), "w") as fh:
-                fh.write(render_html(self.state, self.port, self.interval))
-        except Exception as e:  # noqa: BLE001
-            print(f"[gitreal] write error: {e}", file=sys.stderr)
+        atomic_write_text(os.path.join(self.outdir, "git-real.json"),
+                          json.dumps(self.state, indent=2) + "\n")
+        if not self.config.get("quick"):
+            atomic_write_text(os.path.join(self.outdir, "git-real.html"),
+                              render_html(self.state, self.port, self.interval))
 
     def get_state(self):
         with self.lock:
@@ -1853,6 +2142,94 @@ def start_polling(app: App, stop_event: threading.Event):
 SKIP_WALK_DIRS = JUNK_DIR_NAMES | {".git", OUTPUT_DIRNAME, ".hg", ".svn", ".idea"}
 
 
+def load_registry_repo_paths(repos_file: str) -> list[str]:
+    """Load discovery-enabled Git paths from a committed fleet projection or a repos list.
+
+    Accepts either:
+      {"repositories": [{"physical_location": "...", "discovery_enabled": true}, ...]}
+      {"repos": ["...", "..."]}
+    The committed projection is the canonical workshop input. Ignored
+    `.git-real/fleet.json` is not authority.
+    """
+    with open(repos_file, encoding="utf-8") as fh:
+        data = json.load(fh)
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        p = os.path.abspath(os.path.expanduser(str(raw)))
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    if isinstance(data, dict) and isinstance(data.get("repositories"), list):
+        for row in data["repositories"]:
+            if not isinstance(row, dict):
+                continue
+            if row.get("discovery_enabled") is False:
+                continue
+            loc = row.get("physical_location")
+            if loc:
+                add(loc)
+        return paths
+    if isinstance(data, dict) and isinstance(data.get("repos"), list):
+        for raw in data["repos"]:
+            add(raw)
+        return paths
+    raise ValueError("repos file must contain repositories[] or repos[]")
+
+
+def discover_all_git(root: str, max_depth: int = 4) -> list[str]:
+    """Bounded git discovery that keeps descending into nested repositories.
+
+    This is a drift signal, not fleet authority. It records every `.git` found
+    up to max_depth instead of stopping at the first nested repository.
+    """
+    root = os.path.abspath(root)
+    found, seen = [], set()
+    base = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.rstrip("/").count("/") - base
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        has_git = ".git" in dirnames or ".git" in filenames
+        dirnames[:] = [d for d in dirnames if d not in SKIP_WALK_DIRS]
+        if has_git:
+            p = os.path.abspath(dirpath)
+            if p not in seen:
+                seen.add(p)
+                found.append(p)
+    return found
+
+
+def registry_fleet_paths(root: str, registered: list[str], max_depth: int = 4) -> dict:
+    """Use registered paths as fleet authority and disk discovery as drift."""
+    present = []
+    missing = []
+    seen = set()
+    for raw in registered:
+        path = os.path.abspath(raw)
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.exists(os.path.join(path, ".git")):
+            present.append(path)
+        else:
+            missing.append(path)
+    disk = [os.path.abspath(p) for p in discover_all_git(root, max_depth=max_depth)]
+    registered_set = set(present) | set(missing)
+    unregistered = [p for p in disk if p not in registered_set]
+    return {
+        "registered": list(seen),
+        "present": present,
+        "missing": missing,
+        "disk": disk,
+        "drift_missing": missing,
+        "drift_unregistered": unregistered,
+    }
+
+
 def discover_repos(root: str, max_depth: int = 4, pinned=None) -> list[str]:
     """Walk `root` (bounded depth) collecting git repos.
 
@@ -1917,6 +2294,8 @@ def repo_summary(path: str, config: dict) -> dict:
     repo = GitRepo(path)
     state = build_state(repo, config)
     sc, st = state.get("scores", {}), state.get("status", {})
+    read_complete = state.get("read_complete", True)
+    read_errors = [e for e in (state.get("read_errors") or []) if e]
     return {
         "name": state.get("root_name"), "path": path, "is_repo": state.get("is_repo"),
         "branch": "(detached)" if st.get("detached") else st.get("branch"),
@@ -1924,15 +2303,13 @@ def repo_summary(path: str, config: dict) -> dict:
         "safe_commit_band": sc.get("safe_commit_band"),
         "safe_delete": sc.get("safe_delete"), "safe_delete_label": sc.get("safe_delete_label"),
         "safe_delete_band": sc.get("safe_delete_band"),
-        "dirty_files": len(state.get("files", [])),
-        "secret_count": len(state.get("secrets", [])), "secrets": state.get("secrets", [])[:8],
-        "secrets_in_history": state.get("secrets_in_history", 0),
-        "history_truncated": state.get("history_truncated", False),
-        "scan_truncated": state.get("scan", {}).get("truncated", False),
-        "side_branches": len(state.get("side_branches", [])),
-        "unpushed": len(state.get("unpushed", [])),
+        "read_complete": read_complete,
+        "error": "; ".join(read_errors) if not read_complete and read_errors else None,
+        "dirty_files": None if not read_complete else len(state.get("files", [])),
+        "side_branches": len(state.get("side_branches", [])) if read_complete else None,
+        "unpushed": state.get("unpushed_commit_count") if read_complete else None,
         "ahead": st.get("ahead", 0), "behind": st.get("behind", 0),
-        "stashes": len(state.get("stashes", [])),
+        "stashes": len(state.get("stashes", [])) if read_complete else None,
         "stash_summary": state.get("stash_summary", {}),
         "topology": state.get("topology", {}).get("kind"),
         "embedded": state.get("topology", {}).get("kind") == "tracked_inside_parent",
@@ -1942,10 +2319,63 @@ def repo_summary(path: str, config: dict) -> dict:
             "heavy": state.get("push_weight", {}).get("heavy", False),
         },
         "last_commit": state.get("last_commit"),
+        "worktrees": len(state.get("worktrees", [])) if read_complete else None,
+        "extra_worktree_count": state.get("extra_worktree_count") if read_complete else None,
+        "hidden_path_count": len(state.get("index_inventory", {}).get("hidden_paths", [])),
+        "schema_version": state.get("schema_version"),
+        "generated_at": state.get("generated_at"),
+        "actions": state.get("actions", {}), "closeout": state.get("closeout", {}),
+        "main_equals_origin_main": state.get("main_equals_origin_main"),
+        "hooks": _hook_verdict(path),
     }
 
 
-def build_fleet_state(root: str, repo_paths: list[str], config: dict, workers: int = 8) -> dict:
+def _worktree_count(repo: GitRepo) -> int | None:
+    out, rc, _ = repo._run("worktree", "list")
+    if rc != 0 or not out.strip():
+        return None
+    return len([line for line in out.splitlines() if line.strip()])
+
+
+def _hook_verdict(path: str) -> dict:
+    repo = GitRepo(path)
+    hooks_path_out, rc, _ = repo._run("config", "--get", "core.hooksPath")
+    hooks_path = hooks_path_out.strip() if rc == 0 else ""
+    resolved, rrc, _ = repo._run("rev-parse", "--git-path", "hooks")
+    resolved = resolved.strip() if rrc == 0 else os.path.join(path, ".git/hooks")
+    if not os.path.isabs(resolved):
+        resolved = os.path.join(path, resolved)
+    return {
+        "core_hooks_path": hooks_path or None,
+        "hooks_dir": resolved,
+        "pre_commit": os.path.isfile(os.path.join(resolved, "pre-commit"))
+        and os.access(os.path.join(resolved, "pre-commit"), os.X_OK),
+        "pre_push": os.path.isfile(os.path.join(resolved, "pre-push"))
+        and os.access(os.path.join(resolved, "pre-push"), os.X_OK),
+    }
+
+
+def _repo_is_verified_clean(r: dict) -> bool:
+    """Failed or incomplete Git reads are not clean repositories."""
+    if r.get("error") or r.get("hidden_path_count"):
+        return False
+    if r.get("read_complete") is False:
+        return False
+    if r.get("is_repo") is not True:
+        return False
+    dirty = r.get("dirty_files")
+    if dirty is None:
+        return False
+    return dirty == 0
+
+
+def build_fleet_state(
+    root: str,
+    repo_paths: list[str],
+    config: dict,
+    workers: int = 8,
+    registry_paths: list[str] | None = None,
+) -> dict:
     import concurrent.futures
     repos = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -1954,18 +2384,25 @@ def build_fleet_state(root: str, repo_paths: list[str], config: dict, workers: i
             try:
                 repos.append(f.result())
             except Exception as e:  # noqa: BLE001
-                repos.append({"name": os.path.basename(futs[f]), "path": futs[f],
-                              "is_repo": True, "error": str(e)})
+                repos.append({
+                    "name": os.path.basename(str(futs[f]).rstrip("/")) or str(futs[f]),
+                    "path": futs[f],
+                    "is_repo": None,
+                    "error": str(e),
+                    "read_complete": False,
+                    "dirty_files": None,
+                    "safe_delete": None,
+                    "safe_commit": None,
+                })
 
     def rank(r):
-        return (0 if r.get("secret_count") else 1,
-                r.get("safe_delete") if r.get("safe_delete") is not None else 100,
-                -(r.get("dirty_files") or 0), r.get("name") or "")
+        sd = r.get("safe_delete")
+        if r.get("error") or r.get("read_complete") is False or sd is None:
+            sd = -1
+        return (sd, -(r.get("dirty_files") or 0), r.get("name") or "")
     repos.sort(key=rank)
 
-    # Classify external/vendored repos (remote owned by someone OTHER than the
-    # workspace owner) so they don't count against YOUR fleet's cleanliness. A
-    # repo with no remote is a local workspace repo, NOT external.
+    # Remote-owner classification is informational only, never a safety exclusion.
     def _owner(r):
         rd = r.get("remotes_detail") or []
         url = rd[0].get("url") if rd else None
@@ -1979,28 +2416,38 @@ def build_fleet_state(root: str, repo_paths: list[str], config: dict, workers: i
         from collections import Counter
         c = Counter(o for o in (_owner(r) for r in repos) if o)
         ws_owner = c.most_common(1)[0][0] if c else None
+    registered = {os.path.abspath(p) for p in (registry_paths or [])}
     for r in repos:
         o = _owner(r)
         r["remote_owner"] = o
-        r["external"] = bool(o and ws_owner and o != ws_owner)
-    own = [r for r in repos if not r.get("external")]  # YOUR fleet only
+        path_abs = os.path.abspath(r.get("path") or "")
+        if path_abs in registered:
+            # Workshop governance follows the repository registry, not GitHub org.
+            r["external"] = False
+            r["governed_by_registry"] = True
+        else:
+            r["external"] = bool(o and ws_owner and o != ws_owner)
+            r["governed_by_registry"] = False
+    # Every explicitly selected repository counts. Inferred remote ownership is
+    # informational, never permission to hide a dirty or unreadable repository.
+    own = repos
 
     now = datetime.now(timezone.utc).astimezone()
     totals = {
         "repos": len(repos),
+        "unknown_repos": sum(1 for r in own if r.get("read_complete") is not True),
+        "unknown_unpushed_repos": sum(1 for r in own if r.get("unpushed") is None),
+        "local_closeout_complete_repos": sum(1 for r in own if r.get("closeout", {}).get("local_state_complete") is True),
         "external_repos": sum(1 for r in repos if r.get("external")),
-        # alarm counts below are over YOUR repos only (external excluded)
+        # All explicitly selected repositories contribute to the alarm counts.
         "dirty_repos": sum(1 for r in own if r.get("dirty_files")),
-        "repos_with_secrets": sum(1 for r in own if r.get("secret_count")),
-        "repos_with_history_secrets": sum(1 for r in own if r.get("secrets_in_history")),
-        "scan_truncated_repos": sum(1 for r in own if r.get("scan_truncated")),
-        "history_truncated_repos": sum(1 for r in own if r.get("history_truncated")),
-        "clean_repos": sum(1 for r in own if not r.get("dirty_files") and not r.get("secret_count") and r.get("is_repo")),
+        "clean_repos": sum(1 for r in own if _repo_is_verified_clean(r)),
         "total_dirty_files": sum(r.get("dirty_files") or 0 for r in own),
-        "total_secrets": sum(r.get("secret_count") or 0 for r in own),
-        "total_history_secrets": sum(r.get("secrets_in_history") or 0 for r in own),
         "total_side_branches": sum(r.get("side_branches") or 0 for r in own),
-        "total_unpushed": sum(r.get("unpushed") or 0 for r in own),
+        "total_unpushed": (sum(r["unpushed"] for r in own)
+                           if all(r.get("unpushed") is not None for r in own) else None),
+        "known_unpushed": sum(r.get("unpushed") or 0 for r in own),
+        "unpushed_total_complete": all(r.get("unpushed") is not None for r in own),
         "total_stashes": sum(r.get("stashes") or 0 for r in own),
         "repos_with_unmerged_stashes": sum(
             1 for r in own if (r.get("stash_summary") or {}).get("unmerged")),
@@ -2009,6 +2456,11 @@ def build_fleet_state(root: str, repo_paths: list[str], config: dict, workers: i
     }
     return {
         "version": VERSION, "mode": "fleet",
+        "schema_version": SCHEMA_VERSION,
+        "read_complete": bool(repos) and os.path.isdir(root) and all(r.get("read_complete") is True for r in repos),
+        "read_errors": (["No readable repositories selected"] if not repos else
+                        [r.get("error") or "Repository inventory incomplete" for r in repos if r.get("read_complete") is not True]),
+        "inventory_scope": "Selected repositories only; bounded discovery or an explicit registry, not every excluded directory.",
         "generated_at": now.isoformat(timespec="seconds"),
         "generated_at_human": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "root": os.path.abspath(root), "totals": totals, "repos": repos,
@@ -2172,11 +2624,11 @@ function render(){
  const s=STATE,t=s.totals||{};
  document.getElementById('totals').innerHTML=
    tcard(t.repos||0,'repos')+
-   tcard(t.dirty_repos||0,'dirty repos',(t.dirty_repos?'':'good'))+
-   tcard(t.repos_with_secrets||0,'with secrets',(t.repos_with_secrets?'alert':'good'))+
+   tcard(t.dirty_repos||0,'dirty repos',(t.dirty_repos||t.unknown_repos?'':'good'))+
    tcard(t.total_dirty_files||0,'dirty files')+
    tcard(t.total_side_branches||0,'side branches')+
-   tcard(t.total_unpushed||0,'unpushed')+
+   tcard(t.total_unpushed==null?'?':t.total_unpushed,'unpushed')+
+   tcard(t.unknown_repos||0,'unknown repos',(t.unknown_repos?'alert':''))+
    tcard(t.total_stashes||0,'stashes',(t.repos_with_unmerged_stashes?'alert':''))+
    tcard(t.embedded_repos||0,'embedded',(t.embedded_repos?'alert':''))+
    tcard(t.heavy_repos||0,'heavy repos')+
@@ -2185,18 +2637,19 @@ function render(){
  if(!repos.length){g.innerHTML='<div class="empty">No git repos found under this root.</div>';}
  else g.innerHTML=repos.map((r,i)=>{
    if(r.error)return `<div class="repo clip"><div class="rtop"><span class="rname">${esc(r.name)}</span></div><div class="chip">error: ${esc(r.error)}</div></div>`;
-   const cls=r.external?'external':(r.secret_count?'has-secret':(r.dirty_files?'dirty':'clean'));
+   const cls=(r.dirty_files||r.hidden_path_count)?'dirty':'clean';
    let chips='';
-   if(r.secret_count)chips+=`<span class="chip secret">&#9650; ${r.secret_count} SECRET${r.secret_count>1?'S':''}</span>`;
    if(r.dirty_files)chips+=`<span class="chip dirty">${r.dirty_files} dirty</span>`;
    if(r.side_branches)chips+=`<span class="chip branch">${r.side_branches} side-branch</span>`;
    if(r.unpushed)chips+=`<span class="chip push">${r.unpushed} unpushed</span>`;
+   if(r.unpushed==null)chips+='<span class="chip push">publication unknown</span>';
+   if(r.hidden_path_count)chips+=`<span class="chip dirty">${r.hidden_path_count} hidden-index paths</span>`;
    if(r.stash_count){const un=(r.stash_summary||{}).unmerged||0;
      chips+=`<span class="chip${un?' secret':' branch'}" title="${un} hold unmerged work">${r.stash_count} stash${un?' &middot; '+un+' unmerged':''}</span>`;}
    if(r.embedded)chips+=`<span class="chip branch" title="tracked inside a parent repo - not its own repo">embedded</span>`;
    if((r.push_weight||{}).heavy)chips+=`<span class="chip push" title="heavy pack - slow push/clone">heavy ${esc((r.push_weight||{}).pack_human||'')}</span>`;
    if(r.ahead||r.behind)chips+=`<span class="chip">&#8593;${r.ahead} &#8595;${r.behind}</span>`;
-   if(r.external)chips=`<span class="chip" title="remote owned by ${esc(r.remote_owner||'someone else')} — not your fleet; not counted in totals">external · ${esc(r.remote_owner||'3rd-party')}</span>`+chips;
+   if(r.external)chips=`<span class="chip" title="different remote owner; still included in safety totals">remote owner · ${esc(r.remote_owner||'unknown')}</span>`+chips;
    if(!chips)chips='<span class="chip" style="color:var(--good)">clean</span>';
    return `<div class="repo clip ${cls}" onclick="openRepo(${i})">
      <div class="rtop"><span class="rname">${esc(r.name)}</span><span class="rbranch">${esc(r.branch||'-')}</span></div>
@@ -2208,7 +2661,7 @@ function render(){
  }).join('');
  document.getElementById('updated').textContent=s.generated_at_human||'';
  document.getElementById('rootp').textContent=esc(s.root||'');
- document.title=`GIT_REAL FLEET · ${t.repos||0} repos · ${t.repos_with_secrets||0} secret`;
+ document.title=`GIT_REAL FLEET · ${t.repos||0} repos`;
 }
 async function refresh(){try{const r=await fetch(`http://127.0.0.1:${PORT}/api/fleet`,{cache:'no-store'});if(r.ok){STATE=await r.json();render();}}catch(e){}}
 async function openRepo(i){
@@ -2223,14 +2676,12 @@ async function openRepo(i){
  const reasons=(arr)=>`<ul class="reasons">${(arr||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>-</li>'}</ul>`;
  const fl=(st.files||[]).map(f=>{const cm={staged:'b-staged',modified:'b-dirty',new:'b-new',junk:'b-junk',conflict:'b-conflict'}[f.category]||'b-dirty';
    const nm={staged:'STAGED',modified:'DIRTY',new:'NEW',junk:'JUNK',conflict:'CONFLICT'}[f.category]||'DIRTY';
-   return `<li><span class="badge ${cm}">${nm}</span>${f.has_secret||f.secret_filename?'<span class="badge b-secret">SECRET</span>':''}<span class="fpath">${esc(f.path)}</span></li>`;}).join('');
- const secs=(st.secrets||[]).map(x=>`<li><span class="badge b-secret">${esc(x.severity)}</span><span class="fpath">${esc(x.type)} - ${esc(x.file)}:${x.line} (${esc(x.masked)})${x.in_history?' <b style="color:#ff3b30">[IN HISTORY]</b>':''}</span></li>`).join('');
+   return `<li><span class="badge ${cm}">${nm}</span><span class="fpath">${esc(f.path)}</span></li>`;}).join('');
  sheet.innerHTML=`<span class="closex" onclick="closeModal()">&times;</span><h2>${esc(st.root_name)}</h2><div class="mpath">${esc(st.root)}</div>
    <div class="scorebar"><div class="sc"><div class="v ${bc(sc.safe_commit_band)}">${sc.safe_commit}</div><div class="k">${esc(sc.safe_commit_label||'')}</div></div>
    <div class="sc"><div class="v ${bc(sc.safe_delete_band)}">${sc.safe_delete}</div><div class="k">${esc(sc.safe_delete_label||'')}</div></div></div>
    <div class="subhdr">why - safe to commit</div>${reasons(sc.safe_commit_reasons)}
    <div class="subhdr">why - safe to discard</div>${reasons(sc.safe_delete_reasons)}
-   ${secs?`<div class="subhdr">secrets</div><ul class="flist">${secs}</ul>`:''}
    <div class="subhdr">working tree (${(st.files||[]).length})</div><ul class="flist">${fl||'<li class="fpath">clean</li>'}</ul>`;
 }
 function closeModal(){document.getElementById('modal').classList.remove('open');}
@@ -2240,21 +2691,24 @@ render();setInterval(refresh,Math.max(2000,__INTERVAL__*1000));refresh();
 
 
 def render_fleet_html(state: dict, port: int, interval: float) -> str:
-    html = FLEET_HTML
-    html = html.replace("__STATE_JSON__", json.dumps(state))
-    html = html.replace("__PORT__", str(port))
-    html = html.replace("__INTERVAL__", str(interval))
-    html = html.replace("__VERSION__", VERSION)
-    html = html.replace("__REPO_COUNT__", str(state.get("totals", {}).get("repos", 0)))
-    return html
+    page = FLEET_HTML
+    page = page.replace("__STATE_JSON__", json_for_script(state))
+    page = page.replace("__PORT__", str(port))
+    page = page.replace("__INTERVAL__", str(interval))
+    page = page.replace("__VERSION__", html_text(VERSION))
+    page = page.replace("__REPO_COUNT__", html_text(state.get("totals", {}).get("repos", 0)))
+    return page
 
 
 class FleetApp:
-    def __init__(self, root: str, port: int, interval: float, pinned=None):
+    def __init__(self, root: str, port: int, interval: float, pinned=None, registry_paths=None):
         self.root = os.path.abspath(root)
         self.port, self.interval = port, interval
         self.pinned = pinned or []
+        self.registry_paths = list(registry_paths or [])
         self.outdir = os.path.join(self.root, OUTPUT_DIRNAME)
+        if os.path.islink(self.outdir):
+            raise OSError("Refusing a symlinked GIT_REAL output directory")
         os.makedirs(self.outdir, exist_ok=True)
         gi = os.path.join(self.outdir, ".gitignore")
         if not os.path.exists(gi):
@@ -2262,21 +2716,41 @@ class FleetApp:
                 open(gi, "w").write("*\n")
             except Exception:  # noqa: BLE001
                 pass
-        self.config = {"muted_secret_files": []}
+        self.config = {}
         self.state, self.lock = {}, threading.Lock()
-        self.repo_paths = discover_repos(self.root, pinned=self.pinned)
+        self.drift = {}
+        self.repo_paths = self._discover()
+
+    def _discover(self) -> list[str]:
+        if self.registry_paths:
+            self.drift = registry_fleet_paths(self.root, self.registry_paths)
+            return list(self.drift.get("present") or [])
+        return discover_repos(self.root, pinned=self.pinned)
 
     def rescan(self):
         with self.lock:
-            self.repo_paths = discover_repos(self.root, pinned=self.pinned)
-            self.state = build_fleet_state(self.root, self.repo_paths, self.config)
-            try:
-                with open(os.path.join(self.outdir, "git-real-fleet.json"), "w") as fh:
-                    json.dump(self.state, fh, indent=2)
-                with open(os.path.join(self.outdir, "git-real-fleet.html"), "w") as fh:
-                    fh.write(render_fleet_html(self.state, self.port, self.interval))
-            except Exception as e:  # noqa: BLE001
-                print(f"[gitreal] fleet write error: {e}", file=sys.stderr)
+            self.repo_paths = self._discover()
+            self.state = build_fleet_state(
+                self.root,
+                self.repo_paths,
+                self.config,
+                registry_paths=self.registry_paths,
+            )
+            if self.registry_paths:
+                self.state["registry_authority"] = True
+                self.state["drift_unregistered"] = list(self.drift.get("drift_unregistered") or [])
+                self.state["drift_missing"] = list(self.drift.get("drift_missing") or [])
+                self.state.setdefault("totals", {})
+                self.state["totals"]["drift_unregistered"] = len(self.state["drift_unregistered"])
+                self.state["totals"]["drift_missing"] = len(self.state["drift_missing"])
+                if self.state["drift_missing"]:
+                    self.state["read_complete"] = False
+                    self.state["read_errors"].append("Registered repositories are missing")
+            atomic_write_text(os.path.join(self.outdir, "git-real-fleet.json"),
+                              json.dumps(self.state, indent=2) + "\n")
+            if not self.config.get("quick"):
+                atomic_write_text(os.path.join(self.outdir, "git-real-fleet.html"),
+                                  render_fleet_html(self.state, self.port, self.interval))
             return self.state
 
     def get_state(self):
@@ -2324,38 +2798,33 @@ def make_fleet_handler(app: "FleetApp"):
 
 def run_fleet(args, root: str):
     pinned = []
-    pin_file = os.path.join(root, OUTPUT_DIRNAME, "fleet.json")
-    if os.path.isfile(pin_file):
-        try:
-            pinned = json.load(open(pin_file)).get("repos", [])
-        except Exception:  # noqa: BLE001
-            pass
-    app = FleetApp(root, args.port, args.interval, pinned=pinned)
-    app.config["check_history"] = getattr(args, "history", False)
+    registry_paths = []
+    repos_file = getattr(args, "repos_file", None)
+    if not repos_file:
+        default_projection = os.path.join(root, "governance", "generated", "REPOSITORY_FLEET.json")
+        if os.path.isfile(default_projection):
+            repos_file = default_projection
+    if repos_file:
+        registry_paths = load_registry_repo_paths(repos_file)
+    else:
+        pin_file = os.path.join(root, OUTPUT_DIRNAME, "fleet.json")
+        if os.path.isfile(pin_file):
+            try:
+                pinned = json.load(open(pin_file)).get("repos", [])
+            except Exception:  # noqa: BLE001
+                pass
+    app = FleetApp(root, args.port, args.interval, pinned=pinned, registry_paths=registry_paths)
+    app.config.update(quick=getattr(args, "quick", False))
     app.rescan()
     t = app.state.get("totals", {})
 
     if args.once:
-        print(f"[gitreal] FLEET snapshot -> {app.outdir}/git-real-fleet.html")
-        print(f"           {t.get('repos',0)} repos | {t.get('dirty_repos',0)} dirty | "
-              f"{t.get('repos_with_secrets',0)} with secrets | {t.get('total_side_branches',0)} side-branches")
-        rc = 0
-        # FLEET --fail-on-secret fails CLOSED, exactly like the single-repo path: any repo
-        # with a working-tree secret, a secret ALREADY IN HISTORY, or an incomplete scan
-        # (working-tree file cap or history budget) forces a non-zero exit.
-        if args.fail_on_secret and (t.get("repos_with_secrets") or t.get("repos_with_history_secrets")
-                                    or t.get("scan_truncated_repos") or t.get("history_truncated_repos")):
-            if t.get("repos_with_secrets"):
-                print(f"           !! {t['repos_with_secrets']} repo(s) contain secrets")
-            if t.get("repos_with_history_secrets"):
-                print(f"           !! {t['repos_with_history_secrets']} repo(s) have secrets ALREADY IN HISTORY")
-            if t.get("scan_truncated_repos"):
-                print(f"           !! {t['scan_truncated_repos']} repo(s) had an INCOMPLETE scan "
-                      f"(file cap hit) - cannot certify secret-free")
-            if t.get("history_truncated_repos"):
-                print(f"           !! {t['history_truncated_repos']} repo(s) had an INCOMPLETE history scan "
-                      f"(budget hit) - cannot certify history secret-free")
-            rc = 2
+        print(f"[gitreal] FLEET JSON snapshot -> {app.outdir}/git-real-fleet.json")
+        print(f"           {t.get('repos',0)} repos | {t.get('dirty_repos',0)} dirty | {t.get('total_side_branches',0)} side-branches")
+        if app.registry_paths:
+            print(f"           registry authority | drift_unregistered={t.get('drift_unregistered',0)} "
+                  f"| drift_missing={t.get('drift_missing',0)}")
+        rc = 2 if t.get("unknown_repos") or not app.state.get("repos") or t.get("drift_missing") else 0
         if args.fail_under is not None:
             low = [r for r in app.state["repos"] if (r.get("safe_commit") or 0) < args.fail_under]
             if low:
@@ -2404,7 +2873,7 @@ def run_fleet(args, root: str):
 # ----------------------------------------------------------------------------
 WIRE_BEGIN = "<!-- GIT_REAL hook -->"
 WIRE_END = "<!-- /GIT_REAL -->"
-# Fixed basenames only (never user input), so wiring can never escape the repo root.
+# Fixed basenames plus symlink rejection keep writes at the requested files.
 WIRE_TARGETS = ("CLAUDE.md", "AGENTS.md", ".cursorrules")
 WIRE_DEFAULT = "AGENTS.md"   # created if none of the targets exist yet
 
@@ -2417,20 +2886,23 @@ def wire_block() -> str:
         WIRE_BEGIN,
         "## Git safety (GIT_REAL)",
         "",
-        "Before any `git commit`, `git checkout .`, `git clean -fd`, or `git reset --hard`:",
+        "Before a Git action, request fresh, operation-specific evidence for the actual repo root:",
         "",
-        "1. Refresh the verdict: run `python gitreal.py . --once` (or call the GIT_REAL MCP",
-        "   tool, which is always live; skip the refresh if GIT_REAL is already running and",
-        "   watching this repo). The JSON stamps `generated_at` so you can tell if it is stale.",
-        "2. Read `.git-real/git-real.json` and act on it:",
-        '   - `scores.safe_commit_band` not `"GO"` (or `scores.safe_commit` < 80): do NOT',
-        "     commit. Surface `scores.safe_commit_reasons` and fix them first.",
-        '   - `scores.safe_delete_band` not `"GO"`: do NOT discard the tree. There is unsaved',
-        "     work in `scores.safe_delete_reasons`.",
-        "   - `secrets[]` non-empty: STOP and warn the user. A secret is about to be committed.",
+        "1. Run `python gitreal.py . --quick --once` and read `.git-real/git-real.json`,",
+        "   or call the MCP tool now. A watcher or earlier snapshot is not a substitute.",
+        "2. Require schema_version=2, the intended root, read_complete=true and no read_errors.",
+        "   Commit only the inspected index when actions.commit_index has safe=true and decision=ALLOW.",
+        "3. Discard requires an explicit operation: discard_tracked (restore from index),",
+        "   clean_untracked (-fd), clean_ignored (-fdx), reset_hard with target commit, or",
+        "   drop_stash with selected stash ref. Use is_safe_to_discard(path, operation, target)",
+        "   or CLI --quick --json --operation NAME [--target VALUE]. Require safe=true and ALLOW.",
+        "   Legacy scores are summaries only; the generic discard score never grants GO.",
         "",
-        "Read the verdict and act on it. Do not ask the user about a dirty tree; the answer is",
-        "in the file.",
+        "Filename hints, ignored status, working-tree stash copies and reflogs are not recovery proof.",
+        "No result approves amend, commit -a, force-push, another checkout target, or recursive/extra-force flags.",
+        "Use the resolved reset OID and follow the owner's authorization; preserve unsupported/unknown work.",
+        "Snapshots do not lock future writers or verify remote servers. Recheck after any state change.",
+        "Reconnect MCP after source upgrades; source-change detection blocks an outdated loaded process.",
         WIRE_END,
     ])
 
@@ -2438,6 +2910,8 @@ def wire_block() -> str:
 def _wire_one(path: str, block: str) -> str:
     """Insert or replace the managed block in one file. Returns the action taken:
     created / updated / inserted / unchanged."""
+    if os.path.islink(path):
+        raise OSError("Refusing to rewrite a symlinked agent instruction file")
     if not os.path.isfile(path):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(block + "\n")
@@ -2483,21 +2957,31 @@ def main():
     ap.add_argument("--poll", action="store_true", help="force polling watcher (use on /mnt/c or network drives)")
     ap.add_argument("--no-server", action="store_true", help="write files only, no dashboard server")
     ap.add_argument("--once", action="store_true", help="generate output once and exit")
+    ap.add_argument("--quick", action="store_true", help="inventory only; defer deep stash and push-weight telemetry")
+    ap.add_argument("--json", dest="json_output", action="store_true",
+                    help="print a fresh JSON snapshot without writing dashboard files")
+    ap.add_argument("--operation", choices=tuple(ACTION_SCOPES), help="assess one exact operation without executing it")
+    ap.add_argument("--target", help="explicit reset commit or selected stash ref")
+    ap.add_argument("--request-id", help="echo a caller's unique refresh token in the snapshot")
     ap.add_argument("--init", action="store_true", help="git init if PATH is not a repo")
     ap.add_argument("--all", "--fleet", dest="all", action="store_true",
                     help="FLEET mode: scan PATH for ALL git repos and show the multi-repo command center")
+    ap.add_argument("--repos-file", default=None,
+                    help="FLEET registry authority: JSON projection with repositories[] or repos[]")
     ap.add_argument("--fail-under", type=int, default=None, metavar="N",
                     help="guardrail (with --once): exit 1 if safe-commit < N (use as a pre-commit hook)")
-    ap.add_argument("--fail-on-secret", action="store_true",
-                    help="guardrail (with --once): exit 2 if any secret is detected")
-    ap.add_argument("--history", action="store_true",
-                    help="also scan git history: flag secrets that were ALREADY COMMITTED (incidents)")
     ap.add_argument("--wire-agents", action="store_true",
                     help="install the GIT_REAL hook into CLAUDE.md / AGENTS.md / .cursorrules "
                          "(idempotent; creates AGENTS.md if none exist) and exit")
     args = ap.parse_args()
+    if args.target is not None and args.operation not in ("reset_hard", "drop_stash"):
+        ap.error("--target requires --operation reset_hard or drop_stash")
+    if args.operation and not (args.once or args.json_output):
+        ap.error("--operation requires --once or --json")
+    if args.all and (args.json_output or args.operation or args.target):
+        ap.error("--json and operation checks require one explicit repository")
 
-    root = os.path.abspath(args.path)
+    root = os.path.abspath(os.path.expanduser(args.path))
     if not os.path.isdir(root):
         print(f"[gitreal] not a directory: {root}", file=sys.stderr)
         sys.exit(1)
@@ -2510,12 +2994,30 @@ def main():
               "agents read it before commit/discard")
         sys.exit(0)
 
+
+    if getattr(args, "repos_file", None) and not args.all:
+        print("[gitreal] --repos-file requires --fleet", file=sys.stderr)
+        sys.exit(2)
+
     if args.all:
         run_fleet(args, root)
         return
 
+    if args.json_output:
+        state = build_state(GitRepo(root), {"quick": args.quick, "request_id": args.request_id})
+        if args.operation:
+            state["requested_action"] = assess_action(state, args.operation, args.target)
+        print(json.dumps(state, ensure_ascii=True))
+        if not state.get("read_complete"):
+            sys.exit(2)
+        if args.operation and not state["requested_action"]["safe"]:
+            sys.exit(1)
+        if args.fail_under is not None and state["scores"]["safe_commit"] < args.fail_under:
+            sys.exit(1)
+        return
+
     app = App(root, args.port, args.interval)
-    app.config["check_history"] = args.history
+    app.config.update(quick=args.quick, request_id=args.request_id)
 
     if args.init and not app.repo.is_repo():
         print(f"[gitreal] git init {root}")
@@ -2524,29 +3026,17 @@ def main():
     app.rescan()
     s = app.state
     sc = s.get("scores", {})
+    if args.operation:
+        s["requested_action"] = assess_action(s, args.operation, args.target)
+        app._write_outputs()
 
     if args.once:
         print(f"[gitreal] snapshot written to {app.outdir}/")
         print(f"           safe-commit {sc.get('safe_commit')}% ({sc.get('safe_commit_label')}) | "
               f"safe-discard {sc.get('safe_delete')}% ({sc.get('safe_delete_label')})")
-        if s.get("secrets"):
-            print(f"           !! {len(s['secrets'])} secret finding(s)")
-        hist_secrets = s.get("secrets_in_history", 0) or 0
-        if hist_secrets:
-            print(f"           !! {hist_secrets} secret(s) ALREADY IN HISTORY (incident) - rotate the key(s) and scrub history")
-        scan = s.get("scan", {})
-        if scan.get("truncated"):
-            print(f"           !! INCOMPLETE SCAN: {scan.get('unscanned')} of {scan.get('candidates')} "
-                  f"file(s) NOT scanned (cap {scan.get('limit')}) - cannot certify secret-free")
-        if s.get("history_truncated"):
-            print("           !! INCOMPLETE HISTORY SCAN (budget hit) - cannot certify history secret-free")
-        rc = 0
-        # --fail-on-secret fails CLOSED: never exit 0 when a secret could exist unseen. A
-        # working-tree secret, a secret ALREADY IN HISTORY, OR a scan we could not finish
-        # (working-tree file cap or history budget) each force a non-zero exit.
-        if args.fail_on_secret and (s.get("secrets") or hist_secrets
-                                    or scan.get("truncated") or s.get("history_truncated")):
-            rc = 2
+        rc = 0 if s.get("read_complete") else 2
+        if args.operation and not s["requested_action"]["safe"]:
+            rc = max(rc, 1)
         if args.fail_under is not None and (sc.get("safe_commit") or 0) < args.fail_under:
             print(f"           !! safe-commit {sc.get('safe_commit')}% is below --fail-under {args.fail_under}")
             rc = max(rc, 1)

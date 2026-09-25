@@ -1,3 +1,5 @@
-# GIT_REAL core has no required Python packages.
-# Optional instant file-event watching:
-watchdog>=4.0.0
+# GIT_REAL dashboard has NO required dependencies (pure Python standard library).
+#
+# Optional:
+watchdog>=4.0.0   # instant file-event updates (otherwise GIT_REAL polls). Optional.
+mcp>=1.2.0        # only needed to run the MCP server (gitreal_mcp.py). Optional.

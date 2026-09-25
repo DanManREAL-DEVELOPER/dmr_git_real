@@ -1,54 +1,79 @@
-# The GIT_REAL Background Story
+# The GIT_REAL background story
 
-*Why a solo dev built a git tool for the age of AI agents, and the blind spot his own agent caught along the way.*
+## The problem was never just a dirty tree
 
-## Two years of fighting my own repos
+AI coding agents made it easy to run several workstreams at once. They also
+made it easy to lose the context that gives Git state meaning: which untracked
+file is real work, which branch is unpublished, which stash still contains a
+unique variant, and whether a “cleanup” command is actually destructive.
 
-I have been building with AI coding agents for about two years. Somewhere along the way my setup turned into eight to twelve terminals running at once, agents working in parallel across a pile of git worktrees, features expanding faster than I could track them, and work getting abandoned mid-stream the second a better idea showed up.
+The recurring question was simple:
 
-Git got wild. Dirty trees everywhere. Untracked files I did not recognize. Side branches an agent spun up and forgot about. And the moment that broke me every single time: an agent stops, looks at a working tree, and asks, "there is a dirty tree here, what do you want to do with it?" And I have no idea. Is it junk? Is it an hour of unsaved work I am one wrong keystroke away from nuking? I could not tell, and neither could the agent.
+> There is a dirty working tree. What should I do with it?
 
-I tried everything to stay on top of it. Governance files. Notes. Discipline. It has been my number one pain point since the day I started.
+Plain `git status` describes state. It does not decide whether a particular
+operation preserves that state.
 
-## I went looking for this. It did not exist.
+## The first answer was a dashboard
 
-Before writing a single line, I did the honest thing and went hunting. Opened tabs on every tool I could find. Watched YouTube walkthroughs to see if any of them solved it. There are good git dashboards and good status tools out there, and I respect them. But I could not find one that did the specific thing I needed: drop into any folder, track the whole repo in real time, and then hand a clear verdict to the agents themselves so they stop guessing.
+GIT_REAL began as one dependency-free Python file that turns repository
+metadata into a local dashboard and machine-readable JSON. It inventories
+working-tree changes, refs, upstream state, worktrees, stashes, ignored paths,
+and side branches. FLEET mode puts several repositories on one wall so the
+riskiest unfinished work is visible first.
 
-That gap is the entire reason GIT_REAL exists.
+That solved visibility, but visibility was not enough.
 
-## So I built it
+## Why v1.2 changed the contract
 
-GIT_REAL is one file you drop into a repo. It tracks everything end to end and turns the question "what do I do with this tree?" into two numbers, recomputed live, each with its reasons spelled out:
+Early versions summarized repository risk with commit and discard scores. Those
+scores were useful for orientation, but a generic score can be misused as
+permission for a command it never assessed.
 
-- **Safe to Commit:** how clean a commit would be right now.
-- **Safe to Discard:** how safe it is to nuke the dirty tree, or whether you are about to lose real work.
+GIT_REAL v1.2 therefore moved to operation-specific preservation checks.
 
-It classifies every file the moment it appears, flags secrets with a blinking alert and masks them so nothing leaks, tracks your branches and push state, and for the eight-to-twelve-worktree crowd it has a FLEET mode: one wall, every repo, scored and ranked, with anything dangerous flashing red.
+A plain commit of the current index is not the same operation as `git commit
+-a`. `git clean -fd` is not the same as `git clean -fdx`. Resetting to an
+explicit commit is not the same as checking out an arbitrary branch. Dropping
+one stash is not the same as clearing every stash.
 
-But the part that actually matters, the thing I could not find anywhere else: GIT_REAL writes a machine-readable verdict to `.git-real/git-real.json`, and your agents read it before they commit or discard. There is even an MCP server so they can call it mid-task. Every other git tool renders your repo for a human to read. GIT_REAL writes a decision an agent acts on. That is the whole trick.
+The v1.2 engine returns an `ALLOW` or `BLOCK` for the exact supported operation
+and target. The result is bound to the repository root, HEAD, index
+fingerprint, and a unique publication ID. Incomplete reads and unknown
+publication evidence fail closed.
 
-## The part I am proudest of, and it is a confession
+That is the product's real purpose: not to tell an agent that a repository
+“looks fine,” but to force the agent to name the operation it intends to
+perform and show preservation evidence for that operation.
 
-I have a brand built on showing the machinery, so here is the machinery.
+## Local by design
 
-While I was prepping the launch, one of my own AI agents was helping me rename some folders, and it caught a blind spot in my secret scanner. My regex was missing a whole class of secrets: snake_case keys like `db_password`, and `aws_secret_access_key = "..."` value lines. The exact kind of thing that leaks into a repo and turns into a 2 a.m. incident. My own stress test had missed it. My agent did not.
+The core has no telemetry and sends no repository data to a hosted service.
+The dashboard binds locally, the MCP adapter uses stdio, and `--json` can
+produce a fresh result without writing dashboard files.
 
-We fixed it with two surgical regex changes and a nine-case regression test. And then I did the only honest thing I could think of: I put that exact secret into the demo, so the launch clip literally shows GIT_REAL catching the thing my own testing missed. That is not a polished marketing moment. It is the real one, and it is the one I wanted to show you.
+GIT_REAL deliberately does not inspect repository file contents for secrets.
+Secret scanning is a different security control and should be handled by a
+dedicated scanner.
 
-That whole experience pushed the next feature too: secret-in-history detection, which tells you whether a secret was caught in time, or is already committed and needs to be rotated and scrubbed.
+## Built with the workflow it protects
 
-## It was built the way it is meant to be used
+GIT_REAL was developed in the same environment it is meant to help: multiple
+agents, multiple worktrees, unfinished branches, and frequent handoffs. Its
+adversarial tests now cover cases such as ignored data, hidden index flags,
+unusual filenames, clean-but-ahead branches, stash variants, incomplete reads,
+stale publications, and explicit no-op scopes.
 
-Here is the part I love most. GIT_REAL, the tool whose entire job is keeping AI agents honest, was itself built shoulder to shoulder with AI agents. More than one, running in parallel, reconciled through a shared report so nothing drifted between them. Which is exactly the kind of chaos GIT_REAL exists to make sane. The tool and its own origin turned out to be the same story.
+The lesson was direct: evidence must describe the exact action, and unknown
+must remain unknown.
 
 ## Why it is called GIT_REAL
 
-My daughter named it. I was talking through options out loud, and she said, "how about GIT_REAL," like *get real*. It stuck instantly. It is on brand, it made me smile, and now her idea is on a public repo. That one is for her.
+My daughter suggested the name—“GIT_REAL,” like “get real.” It fit the tool:
+stop guessing, inspect the actual repository, and make the intended operation
+explicit.
 
-## It is yours
+GIT_REAL is MIT licensed. Use it, test it against ugly repositories, and keep
+the evidence honest.
 
-GIT_REAL is open source, MIT licensed. Drop it into a repo, point your agents at it, and never debug another agent's dirty tree again.
-
-Get real about your repo.
-
-*- DanManREAL*
+— DanManREAL

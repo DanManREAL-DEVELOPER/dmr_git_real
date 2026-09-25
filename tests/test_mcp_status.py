@@ -19,7 +19,7 @@ def _git(d, *a):
 def _repo():
     d = tempfile.mkdtemp()
     _git(d, "init", "-q")
-    _git(d, "config", "user.email", "developer@example.invalid")
+    _git(d, "config", "user.email", "mcp@example.invalid")
     _git(d, "config", "user.name", "t")
     _git(d, "checkout", "-q", "-b", "main")
     return d
