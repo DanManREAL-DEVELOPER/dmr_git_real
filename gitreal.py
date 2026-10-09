@@ -947,6 +947,48 @@ def artifact_hint(path: str) -> bool:
     return any(r.match(base) for r in JUNK_FILE_RULES)
 
 
+def mark_established_paths(repo, files: list) -> None:
+    """Mark commit candidates that follow what HEAD already tracks.
+
+    An artifact-like path is established when HEAD already tracks that path, files
+    under the same artifact-named directory (e.g. a vendored ``vendor/`` tree), or a
+    same-rule file in the same directory. A large file is established when its HEAD
+    version was already large, so the change is stored as a delta. HEAD, not the
+    index, is the reference: freshly staged files never establish themselves.
+    """
+    if any(f.get("artifact_candidate") for f in files):
+        out, rc, _ = repo._run("ls-tree", "-r", "-z", "--name-only", "HEAD", timeout=120)
+        if rc == 0:
+            committed, dirs, names = set(), set(), {}
+            for path in out.split("\0"):
+                if not path:
+                    continue
+                committed.add(path)
+                parts = path.split("/")
+                for i in range(1, len(parts)):
+                    dirs.add("/".join(parts[:i]) + "/")
+                names.setdefault("/".join(parts[:-1]), []).append(parts[-1])
+            for f in files:
+                if not f.get("artifact_candidate") or f.get("category") == "junk":
+                    continue
+                path = f["path"].rstrip("/")
+                parts = path.split("/")
+                trigger = next((i for i, part in enumerate(parts[:-1]) if part in JUNK_DIR_NAMES), None)
+                if path in committed:
+                    f["artifact_established"] = True
+                elif trigger is not None:
+                    f["artifact_established"] = "/".join(parts[:trigger + 1]) + "/" in dirs
+                else:
+                    rule = next((r for r in JUNK_FILE_RULES if r.match(parts[-1])), None)
+                    f["artifact_established"] = bool(rule) and any(
+                        rule.match(name) for name in names.get("/".join(parts[:-1]), []))
+    for f in files:
+        if f.get("large") and not f.get("huge") and not f.get("untracked") and f.get("x") != "A":
+            out, rc, _ = repo._run("cat-file", "-s", "HEAD:" + f["path"].rstrip("/"))
+            f["large_already_tracked"] = (rc == 0 and out.strip().isdigit()
+                                          and int(out.strip()) >= LARGE_FILE_WARN)
+
+
 def protected_commit_path(path: str) -> bool:
     """Filename-only exclusion; this is not a repository-content secret scan."""
     base = path.rsplit("/", 1)[-1].lower()
@@ -1041,8 +1083,13 @@ def compute_scores(state: dict) -> dict:
     n_untracked = max(len(untracked_new), len(st.get("untracked") or []))
     commit_files = [f for f in files if f.get("staged")] if n_staged else files
     recorded_files = [f for f in commit_files if f.get("x") != "D"]
-    untracked_junk = [f for f in recorded_files if f.get("artifact_candidate") or f.get("category") == "junk"]
-    large_files = [f for f in recorded_files if f.get("large")]
+    # Paths that follow what HEAD already tracks are review notes, not blocks
+    # (Dan 2026-10-09: GIT_REAL must not block agents on legitimate work).
+    untracked_junk = [f for f in recorded_files if (f.get("artifact_candidate") or f.get("category") == "junk")
+                      and not f.get("artifact_established")]
+    established_artifacts = [f for f in recorded_files if f.get("artifact_established")]
+    large_files = [f for f in recorded_files if f.get("large") and not f.get("large_already_tracked")]
+    changed_large = [f for f in recorded_files if f.get("large") and f.get("large_already_tracked")]
     protected = [f for f in recorded_files if protected_commit_path(f["path"])]
     has_dirty = bool(n_staged or n_modified or n_conflicts or n_untracked)
     unpushed = state.get("unpushed") or []
@@ -1075,6 +1122,15 @@ def compute_scores(state: dict) -> dict:
             _lg = ", ".join(f"{f['path']} ({human_size(f.get('size', 0))})" for f in large_files[:3])
             _lm = f" +{len(large_files) - 3} more" if len(large_files) > 3 else ""
             sc_reasons.append(f"{len(large_files)} large file(s) - will bloat history: {_lg}{_lm}.")
+        if established_artifacts:
+            _en = ", ".join(f["path"] for f in established_artifacts[:3])
+            _em = f" +{len(established_artifacts) - 3} more" if len(established_artifacts) > 3 else ""
+            sc_reasons.append(f"Review note: {len(established_artifacts)} artifact-like path(s) follow a location "
+                              f"HEAD already tracks: {_en}{_em}.")
+        if changed_large:
+            _cl = ", ".join(f"{f['path']} ({human_size(f.get('size', 0))})" for f in changed_large[:3])
+            sc_reasons.append(f"Review note: {len(changed_large)} file(s) already large in HEAD changed; "
+                              f"Git stores the change as a delta: {_cl}.")
         if (n_staged + n_modified + len(untracked_new)) > 200:
             sc -= 15
             sc_reasons.append("Very large changeset (>200 files) - possible accidental `git add -A`.")
@@ -2775,6 +2831,7 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         cat = classify_untracked(root, u)
         add_file(u, cat, untracked=True)
 
+    mark_established_paths(repo, files)
     state["files"] = files
 
 

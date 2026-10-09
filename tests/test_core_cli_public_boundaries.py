@@ -109,7 +109,7 @@ class PublicCoreCliBoundaries(unittest.TestCase):
         self.scope=extracted({'__file__':str(SOURCE),'ENGINE_SOURCE_SHA256':hashlib.sha256(SOURCE.read_bytes()).hexdigest(),
             'os':self.env,'sys':sys,'argparse':argparse,'time':time,'datetime':datetime,'timezone':timezone,
             'hashlib':hashlib,'json':json,'re':re,'stat':stat,'math':math,'GitRepo':FakeRepo,
-            'protected_commit_path':lambda path:False,'artifact_hint':lambda path:False,
+            'protected_commit_path':lambda path:False,'artifact_hint':lambda path:False,'mark_established_paths':lambda repo,files:None,
             'resolve_remote_identity':forbidden,'_ref_inspection_preflight':forbidden,
             '_assess_ref_action':lambda *args,**kwargs:(['Authored ref proof not supplied'],{}),
             '_maintenance_hazards':lambda state:[], 'stash_committed_copy':forbidden,
