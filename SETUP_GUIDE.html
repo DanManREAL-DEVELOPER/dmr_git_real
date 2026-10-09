@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GIT_REAL v1.2 Setup Guide</title>
+  <title>GIT_REAL v1.3.1 Setup Guide</title>
   <style>
     :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
     body { margin: 0; background: #0a0f17; color: #eef4ff; line-height: 1.6; }
@@ -20,67 +20,101 @@
 </head>
 <body>
 <main>
-  <div class="badge">GIT_REAL v1.2 · schema 2</div>
+  <div class="badge">GIT_REAL v1.3.1 · schema 2</div>
   <h1>Install once. Check the exact operation.</h1>
   <p>
     GIT_REAL reads repository metadata locally and returns preservation evidence
     for a supported Git operation. It does not execute the operation.
   </p>
 
-  <h2>1. Clone</h2>
+  <h2>1. Get the distribution</h2>
+  <p>If you already have the intended download, use it. Otherwise, when obtaining
+    this public distribution is in scope:</p>
   <pre><code>git clone https://github.com/DanManREAL-DEVELOPER/dmr_git_real.git
 cd dmr_git_real</code></pre>
 
   <h2>2. Install into an existing repository</h2>
-  <pre><code>python setup_gitreal.py "/absolute/path/to/your/project" --with-hook</code></pre>
+  <pre><code>python setup_gitreal.py "/absolute/path/to/your/project"</code></pre>
+  <p>Use Python 3.10 or newer and an available Git executable. The installer copies
+    two runtime files, adds the local output ignore line and wires agent instructions.
+    Add <code>--with-hook</code> only when the selected setup includes a pre-commit
+    hook. An existing custom hook location is preserved by refusing that option;
+    an unmanaged hook is left unchanged and reported as skipped.</p>
   <p>Success requires the exact final receipt:</p>
   <pre><code>GIT_REAL_SETUP_PASS</code></pre>
 
-  <h2>3. Verify without changing the target</h2>
+  <p>A different existing runtime requires authorized replacement with
+    <code>--replace</code>; old files receive unique backups. Use
+    <code>--no-wire-agents</code> to preserve instruction files. A later failure can
+    leave a partial installation, so inspect its receipt and backups before resuming.
+    <code>--no-verify</code> ends with <code>GIT_REAL_SETUP_UNVERIFIED</code>, not a
+    verified success.</p>
+
+  <h2>Optional: check an existing installation</h2>
+  <p>A normal verified install already checks fresh runtime state; this is not a
+    required second step. The mode performs no installer file writes, but executes
+    the installed engine. It is not a sandbox for replacement runtime code, and it
+    does not verify that a hook is active or an MCP client is connected.</p>
   <pre><code>python setup_gitreal.py "/absolute/path/to/your/project" --check</code></pre>
   <p>Success requires:</p>
   <pre><code>GIT_REAL_CHECK_PASS</code></pre>
 
-  <h2>4. Read fresh state</h2>
+  <h2>3. Read fresh state when needed</h2>
   <pre><code>python gitreal.py "/absolute/path/to/your/project" --quick --json</code></pre>
   <div class="callout">
-    Require <code>version == "1.2.0"</code>,
-    <code>schema_version == 2</code>, the canonical root,
+    Require successful JSON object output, <code>version == "1.3.1"</code>,
+    integer <code>schema_version == 2</code>, the canonical root,
+    <code>is_repo == true</code>, a nonempty <code>publication_id</code>,
     <code>read_complete == true</code>, and an empty
     <code>read_errors</code> list.
   </div>
 
-  <h2>5. Check a plain commit</h2>
-  <pre><code>python gitreal.py "/absolute/path/to/your/project"   --quick --json --operation commit_index</code></pre>
+  <h2>4. Assess a plain commit when it is in scope</h2>
+  <pre><code>python gitreal.py "/absolute/path/to/your/project" --quick --json --operation commit_index</code></pre>
   <p>
     Commit only when the fresh <code>requested_action</code> names
     <code>commit_index</code>, has <code>safe == true</code>, and returns
-    <code>decision == "ALLOW"</code>.
+    <code>decision == "ALLOW"</code>, and the operation is authorized. The verdict
+    covers the inspected root, HEAD, index and publication identity. It does not
+    cover commit-all, amend, path arguments or later changes. A valid
+    <code>BLOCK</code> can accompany successful installation; setup success is not
+    commit approval.
   </p>
 
-  <h2>Supported operation checks</h2>
+  <h2>Examples of supported operation checks</h2>
   <ul>
     <li><code>commit_index</code> — plain commit of the inspected index.</li>
     <li><code>discard_tracked</code> — restore tracked worktree files from the index.</li>
     <li><code>clean_untracked</code> — plain <code>git clean -fd</code>.</li>
     <li><code>clean_ignored</code> — plain <code>git clean -fdx</code>.</li>
-    <li><code>reset_hard --target &lt;commit&gt;</code> — one explicit commit target.</li>
+    <li><code>reset_hard --target "COMMIT_OID"</code> — replace the placeholder with one explicit commit ID.</li>
     <li><code>drop_stash --target 'stash@{N}'</code> — one selected stash.</li>
   </ul>
+  <p>These are assessments, not execution commands. Other operation contracts are
+    described in <a href="./README.md">README.md</a>. For an existing MCP client,
+    <code>is_safe_to_commit(path)</code> returns the action fields directly;
+    <code>git_real_status(path)</code> returns repository state. Use
+    <a href="./AGENT_SETUP.md">AGENT_SETUP.md</a> for the interface differences.</p>
 
   <h2>Limits</h2>
   <ul>
     <li>A result is a snapshot, not a lock against later writers.</li>
     <li>Local tracking refs are not live remote verification.</li>
     <li>An ALLOW applies only to the exact operation and target returned.</li>
-    <li>GIT_REAL v1.2 does not inspect file contents for secrets.</li>
-    <li>Use dedicated backup, secret-scanning, and access-control systems too.</li>
+    <li>GIT_REAL v1.3.1 does not inspect file contents for secrets.</li>
+    <li>Its receipts do not establish the absence of secrets or authorize a separate
+      scan. Backup and access-control policies remain separate.</li>
+    <li>Incomplete evidence blocks the affected action. Continue independent
+      authorized work and clarify only a consequential unresolved choice.</li>
+    <li>These local receipts do not establish release readiness or authorize
+      publication. Setup does not register, restart or verify an MCP client.</li>
   </ul>
 
   <p>
-    Read <a href="./AGENT_SETUP.md">AGENT_SETUP.md</a>,
-    <a href="./SECURITY.md">SECURITY.md</a>, and
-    <a href="./PRIVACY.md">PRIVACY.md</a> before production use.
+    For agent setup and closeout, use <a href="./AGENT_SETUP.md">AGENT_SETUP.md</a>
+    and <a href="./SKILL.md">SKILL.md</a> when that workflow is requested.
+    Consult <a href="./SECURITY.md">SECURITY.md</a> and
+    <a href="./PRIVACY.md">PRIVACY.md</a> when those boundaries are relevant.
   </p>
 </main>
 </body>

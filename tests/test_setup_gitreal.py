@@ -1,4 +1,4 @@
-"""End-to-end tests for the dependency-free GIT_REAL v1.2 installer."""
+"""End-to-end tests for the dependency-free GIT_REAL v1.3.1 installer."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def fresh_state(target: Path) -> dict:
     return json.loads(result.stdout)
 
 
-def test_install_check_and_hook_are_v12() -> None:
+def test_install_check_and_hook_are_current() -> None:
     target = new_repo()
     first = run(str(target), "--with-hook")
     assert first.returncode == 0, first.stderr
@@ -81,7 +81,7 @@ def test_install_check_and_hook_are_v12() -> None:
     assert ("--fail-on-" + "secret") not in hook_text
 
     state = fresh_state(target)
-    assert state["version"] == "1.2.0"
+    assert state["version"] == "1.3.1"
     assert state["schema_version"] == 2
     assert state["read_complete"] is True
     assert state["read_errors"] == []
@@ -123,7 +123,7 @@ def test_different_runtime_requires_explicit_replace() -> None:
         (target / ".git-real/backups").glob("gitreal.py.*.bak")
     )
     assert len(backups) == 1
-    assert fresh_state(target)["version"] == "1.2.0"
+    assert fresh_state(target)["version"] == "1.3.1"
 
 
 def test_unmanaged_precommit_hook_is_preserved() -> None:

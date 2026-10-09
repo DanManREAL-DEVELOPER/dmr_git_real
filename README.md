@@ -40,7 +40,7 @@ python setup_gitreal.py "/absolute/path/to/your/project" --with-hook
 GIT_REAL_SETUP_PASS
 ```
 
-The installer copies the v1.2 engine, wires the operation-specific agent contract,
+The installer copies the v1.3.1 engine, wires the operation-specific agent contract,
 adds `.git-real/` to `.gitignore`, and can install a fail-closed pre-commit check.
 For a deterministic agent runbook, use [`AGENT_SETUP.md`](./AGENT_SETUP.md).
 
@@ -56,7 +56,7 @@ GIT_REAL answers that. Visually for you, and in machine-readable JSON for the ag
 
 ## The fix: your agents read the verdict, not you
 
-GIT_REAL v1.2 uses **operation-specific preservation checks**. A clean working tree,
+GIT_REAL v1.3.1 uses **operation-specific preservation checks**. A clean working tree,
 an ignored path, or a directory named `build/` is not blanket permission to delete
 anything. The legacy scores remain summaries; the generic discard score never
 returns `GO`. Agents must use the explicit action result instead.
@@ -88,11 +88,49 @@ Exit status is `0` for a complete read/allowed requested action, `1` for a denie
 requested action, and nonzero for a failed read or publication. A status-only
 exit `0` does not mean every action is allowed.
 
+`--json` refuses `--init` or `--wire-agents` before any write. An operation
+assessment also refuses those write modes. `--repos-file` requires `--fleet`,
+and that check happens before wiring. `--interval` must be finite and greater
+than zero. A standalone explicit `--init` remains a separate initialization
+route; it is not part of a read-only assessment.
+
+Ordinary reads and populated-submodule filter checks refuse enabled or unreadable
+split-index configuration and retained `sharedindex.*` names before index-reading
+commands. The admission directory is bounded to 4,096 entries. Retained names may
+block a currently full index; nothing is cleaned up. A changed loaded source or
+redirected repository/index environment returns incomplete, blocked evidence
+without further inventory. Unknown counts are not proof of an empty repository.
+
+Interactive polling uses the guarded state builder, and interruption closes the
+owned server, stops its watcher and cancels its pending debounce timer. Observer
+and timer joins share a bounded timeout. A rescan already admitted may finish
+after stop; this is not forced thread termination or a lock against later writers.
+Saved configuration must be a JSON object; other values use the empty-config
+fallback while preserving the original file. These source changes do not update
+an installed copy or reconnect a running client automatically.
+
 Or let GIT_REAL install it for you: `python gitreal.py --wire-agents` injects this block into your `CLAUDE.md` / `AGENTS.md` / `.cursorrules` as an idempotent managed block (re-running replaces it, never duplicates; it creates `AGENTS.md` if none of them exist).
+
+The direct wiring command preserves bytes outside one managed marker pair,
+including non-UTF8 bytes, a UTF-8 BOM and existing line endings. It preflights all
+selected files, refuses ambiguous markers, symlinks, hardlinks and nonregular
+paths, and checks that each file still matches its inspected contents before
+replacement. Existing files are staged with their permission mode retained; new
+files use exclusive creation. This is not a multi-file transaction or writer
+lock: later I/O failure can leave earlier files updated, and a failed new-file
+write can leave an incomplete new file. Extended metadata, crash durability and
+hostile filesystem races are outside this guarantee.
+
+Wiring writes instructions only. It does not install the runtime, configure MCP,
+inspect Git or restart clients. The generated relative command assumes
+`gitreal.py` is available in the target repository; otherwise use an already
+configured MCP route. The instructions preserve the owner's authorization for
+later Git actions. The setup installer retains the narrower encoding checks
+described in `AGENT_SETUP.md`.
 
 The [MCP server](#agent-integration-mcp) exposes the same engine. It reads repository
 state on each call. Reconnect after changing the engine or adapter source: a loaded
-v1.2 process detects that change and fails closed rather than claiming current rules.
+v1.3.1 process detects that change and fails closed rather than claiming current rules.
 
 ## Three ways to run it
 
@@ -133,10 +171,48 @@ The FLEET wall shows every repo as a card with its safe-commit and safe-discard 
 | `reset_hard` | Nonrecursive reset to an explicit commit | Target preserves current HEAD ancestry; no dirty/hidden tracked work; a different target cannot have unproven local-path collisions. Use the returned resolved OID, not a mutable branch name. |
 | `drop_stash` | One selected `stash@{N}` | Canonical stash ancestry and exact saved index, worktree, and untracked deltas durably present in the retained current branch. Working-tree presence alone is insufficient. |
 
-These checks do not perform the action or grant user authorization. Other checkout
-targets, force-push, branch/worktree removal, recursive submodule operations,
-`stash clear`, and additional flags are **not assessed**. Preserve work and follow
-the owner's workflow instead of translating a different action's `ALLOW` into permission.
+The engine also provides exact `stage_paths`, `maintain_objects`, `create_branch`,
+`switch_branch`, `fast_forward`, `delete_branch`, and `push_origin` assessments.
+These require their own request and input evidence; the six basic rows above are
+not a substitute for their exact contract. Use `python gitreal.py --help` and read
+the returned operation, reasons and binding fields. No assessed action is executed
+by the engine.
+
+The staging preview is a direct CLI operation:
+
+```bash
+python gitreal.py . --quick --json --operation stage_paths --stage-path path/to/file
+```
+
+Repeat `--stage-path` for additional paths. The preview validates bounded inputs
+before repository inspection, then runs a temporary `git add` with its own index,
+object directory and per-instance environment. That temporary add uses an empty
+hooks directory and command-local `core.splitIndex=false`. Existing executable
+filter refusal still applies. Enabled or unreadable split-index configuration,
+retained `sharedindex.*` names, or an index directory exceeding the 4,096-entry
+admission bound cause refusal before index inspection. Retained names can block a
+currently full index; the preview preserves them instead of cleaning them up.
+
+The returned manifest keeps the original `head_oid` and `index_fingerprint`, plus
+the candidate fingerprint and manifest digest. `baseline_publication_id` names
+the initial observation; the action's `publication_id` names the returned state.
+Observed changes and incomplete candidate metadata block approval. Repeated
+observations do not lock future writers or concurrent configuration changes.
+The manifest is not permission to stage or commit, and the CLI does not apply it
+to the real index. Public MCP status assessments do not expose `stage_paths`;
+they refuse it before inspection. The setup installer copies the runtime but
+does not provide a separate staging-apply command.
+
+These checks do not grant user authorization. Force-push, recursive submodule
+operations, `stash clear`, worktree removal and unspecified extra flags remain
+outside the described exact contracts. Preserve work instead of translating a
+different action's `ALLOW` into permission.
+
+Read-only inspection refuses active clean/process filters before Git can run a
+configured driver, including populated submodules and untracked staging candidates.
+Installed but unused filters are allowed when complete bounded metadata establishes
+that they do not apply. This conservative boundary also applies to active Git LFS
+filters; the tool does not disable them or pretend they are side-effect-free.
 
 The commit score evaluates the actual index when staged changes exist; otherwise
 it is only a working-tree preview. Filename-based local-data/key exclusions are
@@ -256,7 +332,7 @@ python gitreal.py [PATH] [options]
 ```jsonc
 {
   "schema_version": 2,
-  "version": "1.2.0",
+  "version": "1.3.1",
   "read_complete": true,
   "read_errors": [],
   "root": "/absolute/repository/root",
@@ -276,6 +352,28 @@ python gitreal.py [PATH] [options]
 ```
 
 FLEET writes `.git-real/git-real-fleet.json` with `totals` plus a per-repo summary array.
+An explicit `--repos-file`, or the root's `governance/generated/REPOSITORY_FLEET.json`,
+is selection authority even when its enabled list is empty. Invalid or unreadable
+registry entries refuse the run; they never fall back to discovery. The registry
+list is loaded at startup. Restart an owned fleet run to adopt a changed list.
+Without a registry, discovery stays bounded; `.git-real/fleet.json` adds pins
+(relative paths resolve from the fleet root). Discovery errors are incomplete evidence.
+
+`--once` exits 2 when the fleet result is incomplete, including missing registered
+repositories or snapshot publication failure; a score threshold is a summary check,
+not permission for a Git operation. Refresh failures replace live in-memory evidence
+with an explicit incomplete state. A write failure may leave older saved files;
+check timestamps and the current result. Each output file is published atomically,
+but JSON and HTML are not a transactional pair.
+
+The fleet dashboard marks saved/stale snapshots and incomplete inventory explicitly.
+Hook fields describe executable-file presence only; unknown hook metadata stays
+unknown, and no hook is executed. The HTTP reader accepts exact endpoints and local
+Host/Origin values; open the printed localhost URL for live details. Interactive
+cleanup closes its owned socket and joins its owned worker for up to two seconds.
+An already running repository inspection may finish after that bound. These source
+repairs do not restart an installed client or certify native Git behavior.
+
 
 ## Known limitations
 
@@ -303,3 +401,36 @@ Why a solo dev built this: [`Background_Story.md`](./Background_Story.md).
 MIT, see `LICENSE`.
 
 <sub>Not affiliated with the unrelated <code>watany-dev/gitreal</code>. The name was suggested by the author's daughter: "GIT_REAL", get real.</sub>
+
+## Local release verification
+
+Run `python scripts/release_check.py`. Its final success line is
+`GIT_REAL_RELEASE_CHECK_PASS`; this is a local check, not publication approval.
+The gate collects every pytest suite and runs legacy script suites in children.
+When comparing a private source checkout, set `GIT_REAL_PRIVATE_SOURCE` to that
+checkout so both runtime files must match byte-for-byte. Without that source,
+standalone checks cannot establish private-source parity.
+
+The installer requires the actual repository root. It preflights both runtime
+conflicts, refuses symlinked installation targets, and keeps uniquely named backups
+on every explicit `--replace`, including multiple replacements within one second.
+Linked-worktree hook installation is refused before runtime writes; installation
+without `--with-hook` remains available at the actual worktree root.
+
+Ignore-file updates preserve existing bytes. Managed hook updates preserve bytes
+outside one exact marker pair; malformed blocks are refused. Symlinked `.git`
+directories, multiply linked files and incompatible destinations are refused.
+If `core.hooksPath` is configured, omit `--with-hook` to preserve that setup.
+The installer retains stricter managed-agent checks: valid UTF-8, LF line endings
+and one exact marker pair. The direct wiring command supports byte-preserving
+updates more broadly. `--no-wire-agents` leaves instruction files untouched.
+See `AGENT_SETUP.md` for the installer boundary.
+
+A verification response must identify the publication and exact target root and
+contain a consistent `commit_index` decision. A valid `BLOCK` can accompany a
+successful installation: installing the tool does not approve a commit. Setup
+is not a multi-file transaction; an I/O failure after preflight can leave a partial
+installation, with replacement backups retained for inspection.
+
+`--no-verify` explicitly skips the repository check and returns
+`GIT_REAL_SETUP_UNVERIFIED`, never the verified setup receipt.

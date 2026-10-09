@@ -15,12 +15,12 @@ It will:
   * immediately begin tracking git end-to-end (modified / staged / untracked /
     branches / push state / stashes / ignored)
   * classify every new file as DIRTY until committed
-  * compute Safe-Commit% and Safe-Delete% scores (answers: "is it safe to commit
-    this?" and "is it safe to nuke this dirty tree?")
+  * compute structural commit/discard summary scores; explicit operation
+    decisions are required before treating a snapshot as action evidence
   * write two outputs that auto-refresh:
         .git-real/git-real.html   <- for HUMANS (live dashboard)
         .git-real/git-real.json   <- for AGENTS (Claude Code / Codex read this)
-  * serve a live dashboard at http://127.0.0.1:8787 with one-click .gitignore add
+  * serve a read-only live dashboard at http://127.0.0.1:8787
 
 Zero hard dependencies (pure stdlib). If `watchdog` is installed it is used for
 instant file events; otherwise GIT_REAL falls back to lightweight polling.
@@ -50,13 +50,14 @@ import re
 import socketserver
 import stat
 import subprocess
+import shutil
 import sys
 import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.2.0"
+VERSION = "1.3.1"
 SCHEMA_VERSION = 2
 with open(__file__, "rb") as _source_file:
     ENGINE_SOURCE_SHA256 = hashlib.sha256(_source_file.read()).hexdigest()
@@ -66,6 +67,15 @@ DEFAULT_INTERVAL = 4.0
 LARGE_FILE_WARN = 5_000_000          # bytes; warn about big untracked/staged files
 LARGE_FILE_CRIT = 50_000_000         # bytes; Git-LFS territory
 DEBOUNCE_SECONDS = 0.75              # collapse bursts of fs events into one rescan
+
+# stage_paths resource ceilings are implementation bounds, not safety thresholds.
+# GIT_REAL still decides from the exact simulated manifest rather than a magic
+# "N files is safe" cutoff.
+STAGE_MAX_REQUEST_PATHS = 4096
+STAGE_MAX_PATH_BYTES = 4096
+STAGE_MAX_MANIFEST_ENTRIES = 50_000
+STAGE_MAX_REPORTED_PATHS = 128
+STAGE_MAX_METADATA_ENTRIES = 4096
 
 # Untracked junk that should almost always be gitignored.
 JUNK_DIR_NAMES = {
@@ -250,9 +260,10 @@ def resolve_remote_identity(url: str, ssh_config_path: str | None = None) -> dic
 # git interface (raw subprocess; no third-party deps)
 # ----------------------------------------------------------------------------
 class GitRepo:
-    def __init__(self, root: str):
+    def __init__(self, root: str, *, git_environment: dict[str, str] | None = None):
         self.root = os.path.abspath(root)
         self.read_errors: list[str] = []
+        self.git_environment = None if git_environment is None else dict(git_environment)
 
     def _run(self, *args, timeout=25, input_text=None):
         try:
@@ -262,7 +273,9 @@ class GitRepo:
                 capture_output=True, text=True, encoding="utf-8",
                 errors="surrogateescape", timeout=timeout,
                 input=input_text,
-                env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0"},
+                env={**(os.environ if self.git_environment is None else self.git_environment),
+                     "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0",
+                     "GIT_NO_LAZY_FETCH": "1"},
             )
             return r.stdout, r.returncode, r.stderr
         except FileNotFoundError:
@@ -293,9 +306,14 @@ class GitRepo:
     # --- status -------------------------------------------------------------
     def status(self) -> dict:
         """Parse NUL-delimited porcelain; collapsed directories are never disposable."""
-        out, rc, err = self._run(
-            "status", "--porcelain=v2", "-z", "--branch",
-            "--untracked-files=normal", "--ignore-submodules=none")
+        try:
+            _status_filter_preflight(self)
+        except (OSError, ValueError, RuntimeError) as exc:
+            out, rc, err = "", 1, str(exc)
+        else:
+            out, rc, err = self._run(
+                "status", "--porcelain=v2", "-z", "--branch",
+                "--untracked-files=normal", "--ignore-submodules=none")
         data = {
             "branch": None, "upstream": None, "ahead": 0, "behind": 0,
             "detached": False, "oid": None,
@@ -307,39 +325,54 @@ class GitRepo:
             "error": None if rc == 0 else (err.strip() or f"git status failed (rc={rc})"),
         }
         if rc != 0:
+            self.read_errors.append(data["error"])
             return data
+        def malformed(message):
+            data.update(ok=False, complete=False, error=message)
+            self.read_errors.append(message)
+            return data
+        if out and not out.endswith("\0"):
+            return malformed("Incomplete porcelain status framing")
         records = iter(out.split("\0"))
         for line in records:
             if not line:
                 continue
-            if line.startswith("# branch.head"):
+            if line.startswith("# "):
+                key, separator, value = line[2:].partition(" ")
+                if key in {"branch.head", "branch.oid", "branch.upstream", "branch.ab"} and (not separator or not value):
+                    return malformed("Malformed porcelain branch header")
+            if line.startswith("# branch.head "):
                 head = line.split(" ", 2)[2]
                 if head == "(detached)":
                     data["detached"] = True
                 else:
                     data["branch"] = head
-            elif line.startswith("# branch.upstream"):
+            elif line.startswith("# branch.upstream "):
                 data["upstream"] = line.split(" ", 2)[2]
-            elif line.startswith("# branch.ab"):
-                m = re.search(r"\+(\d+)\s+-(\d+)", line)
-                if m:
-                    data["ahead"], data["behind"] = int(m.group(1)), int(m.group(2))
-                    data["ahead_behind_known"] = True
-            elif line.startswith("# branch.oid"):
-                data["oid"] = line.split(" ", 2)[2]
+            elif line.startswith("# branch.ab "):
+                m = re.fullmatch(r"# branch\.ab \+([0-9]+) -([0-9]+)", line)
+                if not m:
+                    return malformed("Malformed porcelain ahead/behind header")
+                data["ahead"], data["behind"] = int(m.group(1)), int(m.group(2))
+                data["ahead_behind_known"] = True
+            elif line.startswith("# branch.oid "):
+                oid = line.split(" ", 2)[2]
+                if oid != "(initial)" and not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid):
+                    return malformed("Malformed porcelain branch object name")
+                data["oid"] = oid
             elif line.startswith("1 ") or line.startswith("2 "):
                 renamed = line.startswith("2 ")
                 parts = line.split(" ", 9 if renamed else 8)
                 if len(parts) != (10 if renamed else 9) or len(parts[1]) != 2:
-                    data.update(ok=False, complete=False, error="Malformed porcelain status record")
-                    return data
+                    return malformed("Malformed porcelain status record")
                 xy = parts[1]
                 path = parts[-1]
+                if not path:
+                    return malformed("Missing porcelain status path")
                 if renamed:
                     original = next(records, None)
-                    if original is None:
-                        data.update(ok=False, complete=False, error="Truncated rename record")
-                        return data
+                    if not original:
+                        return malformed("Truncated rename record")
                     data["renamed"].append(path)
                 if parts[2].startswith("S"):
                     data["submodules"].append({"path": path, "state": parts[2]})
@@ -351,17 +384,17 @@ class GitRepo:
                     data["modified"].append({"path": path, "y": work_flag})
             elif line.startswith("u "):
                 parts = line.split(" ", 10)
-                if len(parts) != 11:
-                    data.update(ok=False, complete=False, error="Malformed conflict record")
-                    return data
+                if len(parts) != 11 or not parts[-1]:
+                    return malformed("Malformed conflict record")
                 data["conflicts"].append(parts[-1])
             elif line.startswith("? "):
+                if not line[2:]:
+                    return malformed("Missing untracked status path")
                 data["untracked"].append(line[2:])
             elif not line.startswith("# "):
-                data.update(ok=False, complete=False, error="Unknown porcelain status record")
-                return data
+                return malformed("Unknown porcelain status record")
         if data["oid"] is None or (data["branch"] is None and not data["detached"]):
-            data.update(ok=False, complete=False, error="Missing porcelain branch evidence")
+            return malformed("Missing porcelain branch evidence")
         return data
 
     def index_blob_size(self, path: str) -> int | None:
@@ -378,23 +411,35 @@ class GitRepo:
     def index_inventory(self) -> dict:
         """Metadata only: detect status-hidden work and fingerprint the index."""
         out, rc, _ = self._required("ls-files", "--stage", "-v", "-z")
-        data = {"hidden_paths": [], "gitlinks": [],
+        data = {"hidden_paths": [], "gitlinks": [], "unmerged_paths": [],
                 "fingerprint": hashlib.sha256(out.encode("utf-8", "surrogateescape")).hexdigest()}
         if rc:
             return data
+        if out and not out.endswith("\0"):
+            self.read_errors.append("Incomplete index inventory framing")
+            return data
+        seen = set()
         for row in out.split("\0"):
             if not row:
                 continue
             tag, _, rest = row.partition(" ")
             meta, sep, path = rest.partition("\t")
             fields = meta.split()
-            if not sep or len(tag) != 1 or len(fields) != 3:
+            if (not sep or len(tag) != 1 or tag.upper() not in "HSMRCK?U" or len(fields) != 3
+                    or not path or os.path.isabs(path)
+                    or any(part in ("", ".", "..") for part in path.split("/"))
+                    or fields[0] not in ("100644", "100755", "120000", "160000")
+                    or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[1])
+                    or fields[2] not in ("0", "1", "2", "3") or (path, fields[2]) in seen):
                 self.read_errors.append("Malformed index inventory")
                 continue
+            seen.add((path, fields[2]))
             if tag.islower() or tag.upper() == "S":
                 data["hidden_paths"].append({"path": path, "flag": tag})
             if fields[0] == "160000":
                 data["gitlinks"].append(path)
+            if fields[2] != "0":
+                data["unmerged_paths"].append(path)
         return data
 
     def worktrees(self) -> list[dict]:
@@ -462,8 +507,29 @@ class GitRepo:
         if not os.path.isabs(index):
             index = os.path.join(self.root, index)
         gitdir = os.path.dirname(index)
-        return {"index_locked": os.path.lexists(index + ".lock"),
-                "active_operations": [n for n in names[1:] if os.path.lexists(os.path.join(gitdir, n))]}
+        markers = {"index_locked": os.path.lexists(index + ".lock"),
+                   "active_operations": [n for n in names[1:] if os.path.lexists(os.path.join(gitdir, n))],
+                   "merge_parents": []}
+        if "MERGE_HEAD" in markers["active_operations"]:
+            try:
+                path = os.path.join(gitdir, "MERGE_HEAD")
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    raise ValueError("MERGE_HEAD is not a regular file")
+                with open(path, "rb") as stream:
+                    raw = stream.read(65537)
+                parents = raw.decode("ascii").splitlines()
+                if (len(raw) > 65536 or not parents
+                        or any(not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", p) for p in parents)):
+                    raise ValueError("Malformed MERGE_HEAD parent inventory")
+                out, rc, _ = self._required(
+                    "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                    input_text="\n".join(parents) + "\n")
+                if rc or out.splitlines() != [p + " commit" for p in parents]:
+                    raise ValueError("MERGE_HEAD parents are not verified commit objects")
+                markers["merge_parents"] = parents
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.read_errors.append(str(exc))
+        return markers
 
     def ignored_entries(self) -> list[str]:
         """Ignored files, directories collapsed (node_modules/ as one entry)."""
@@ -668,6 +734,166 @@ class GitRepo:
             })
         return details
 
+    def object_storage(self) -> dict:
+        """Cheap metadata inventory, never a reachability or content scan."""
+        data = {
+            "complete": False, "errors": [], "loose_count": None,
+            "loose_bytes": None, "packed_count": None, "pack_count": None,
+            "packed_kib": None, "pack_bytes": None, "garbage_count": None,
+            "garbage_bytes": None,
+            "effective_loose_threshold": None, "fanout_threshold": None,
+            "max_fanout": None, "sampled_fanout": "17", "sampled_fanout_count": None,
+            "gc_log": {"status": "unknown"},
+            "pending_maintenance": {"status": "unknown"},
+            "maintenance_required": None, "inventory_fingerprint": None,
+            "config_fingerprint": None, "unsupported_reasons": [],
+        }
+        errors = data["errors"]
+        try:
+            raw, rc, _ = self._run("count-objects", "-v")
+            if rc:
+                raise ValueError("git count-objects inventory failed")
+            counts = {}
+            for line in raw.splitlines():
+                key, sep, value = line.partition(":")
+                if not sep or key in counts:
+                    raise ValueError("Malformed object count inventory")
+                if key == "alternate":
+                    data["unsupported_reasons"].append("alternate object store")
+                    continue
+                if key not in ("count", "size", "in-pack", "packs", "size-pack", "prune-packable", "garbage", "size-garbage"):
+                    raise ValueError("Unknown object count inventory field")
+                if not value.strip().isdigit():
+                    raise ValueError("Malformed object count inventory value")
+                counts[key] = int(value.strip())
+            if set(counts) != {"count", "size", "in-pack", "packs", "size-pack", "prune-packable", "garbage", "size-garbage"}:
+                raise ValueError("Incomplete object count inventory")
+            data.update(packed_count=counts["in-pack"], pack_count=counts["packs"],
+                        packed_kib=counts["size-pack"], pack_bytes=counts["size-pack"] * 1024,
+                        garbage_count=counts["garbage"], garbage_bytes=counts["size-garbage"] * 1024)
+
+            cfg, rc, _ = self._run("config", "--null", "--list")
+            if rc or (cfg and not cfg.endswith("\0")):
+                raise ValueError("Git configuration inventory failed")
+            data["config_fingerprint"] = hashlib.sha256(
+                cfg.encode("utf-8", "surrogateescape")).hexdigest()
+            config = {}
+            for record in cfg.split("\0"):
+                if record:
+                    key, sep, value = record.partition("\n")
+                    if not sep or not key:
+                        raise ValueError("Malformed Git configuration inventory")
+                    config[key.lower()] = value
+            for key in config:
+                if (key.startswith("extensions.") and key != "extensions.objectformat"
+                        or key.endswith(".promisor") or key.startswith("repack.")):
+                    data["unsupported_reasons"].append("unsupported object-storage Git configuration")
+                    break
+            def numeric(name, default):
+                value = config.get(name, str(default))
+                if not re.fullmatch(r"\d+", value):
+                    raise ValueError("Malformed object-maintenance threshold configuration")
+                return int(value)
+            auto = numeric("gc.auto", 6700)
+            limit = numeric("gc.autopacklimit", 50)
+            data["effective_loose_threshold"] = auto
+            data["effective_pack_threshold"] = limit
+            # Git samples fanout 17, not the fullest of all 256 buckets.
+            # Disabled auto-GC does not erase a pre-existing object backlog.
+            trigger = auto or 6700
+            data["fanout_threshold"] = (trigger + 255) // 256
+
+            def git_path(name):
+                value, code, _ = self._run("rev-parse", "--git-path", name)
+                if code or not value.strip():
+                    raise ValueError("Git object-storage path could not be resolved")
+                path = value.rstrip("\n")
+                return os.path.abspath(path if os.path.isabs(path) else os.path.join(self.root, path))
+
+            objects = git_path("objects")
+            if not stat.S_ISDIR(os.lstat(objects).st_mode):
+                raise ValueError("Object store is not an ordinary directory")
+            inventory = hashlib.sha256()
+            loose_count = loose_bytes = 0
+            fanouts = {}
+            oid_tail = 38 if config.get("extensions.objectformat", "sha1") == "sha1" else 62
+            if config.get("extensions.objectformat", "sha1") not in ("sha1", "sha256"):
+                raise ValueError("Unsupported Git object format")
+            def walk_error(exc):
+                raise exc
+
+            for directory, dirs, files in os.walk(objects, followlinks=False, onerror=walk_error):
+                dirs.sort()
+                for name in sorted(dirs + files):
+                    path = os.path.join(directory, name)
+                    info = os.lstat(path)
+                    if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise ValueError("Object store contains an unsafe file type")
+                    relative = os.path.relpath(path, objects).replace(os.sep, "/")
+                    inventory.update(f"{relative}\0{info.st_mode}\0{info.st_size}\0{info.st_mtime_ns}\0".encode("utf-8", "surrogateescape"))
+                    parts = relative.split("/")
+                    if (stat.S_ISREG(info.st_mode) and len(parts) == 2
+                            and re.fullmatch(r"[0-9a-f]{2}", parts[0])
+                            and re.fullmatch(r"[0-9a-f]{" + str(oid_tail) + r"}", parts[1])):
+                        loose_count += 1
+                        loose_bytes += info.st_size
+                        fanouts[parts[0]] = fanouts.get(parts[0], 0) + 1
+                    if relative == "info/alternates":
+                        data["unsupported_reasons"].append("alternate object store")
+                    if relative.startswith("pack/") and relative.endswith((".promisor", ".keep")):
+                        data["unsupported_reasons"].append("promisor or protected pack")
+            if loose_count != counts["count"]:
+                raise ValueError("Git and filesystem loose-object inventories disagree")
+            data.update(loose_count=loose_count, loose_bytes=loose_bytes,
+                        max_fanout=max(fanouts.values(), default=0),
+                        sampled_fanout_count=fanouts.get("17", 0),
+                        inventory_fingerprint=inventory.hexdigest())
+
+            log = git_path("gc.log")
+            if os.path.lexists(log):
+                info = os.lstat(log)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 8192:
+                    raise ValueError("gc.log is unsafe or exceeds bounded inspection size")
+                with open(log, "rb") as stream:
+                    content = stream.read(8193)
+                if len(content) != info.st_size:
+                    raise ValueError("gc.log changed during inspection")
+                warning = b"warning: There are too many unreachable loose objects; run 'git prune' to remove them."
+                recognized = content.strip() == warning
+                data["gc_log"] = {
+                    "status": "loose_unreachable_warning" if recognized else "other",
+                    "size_bytes": info.st_size, "sha256": hashlib.sha256(content).hexdigest(),
+                    "mtime_ns": info.st_mtime_ns,
+                }
+            else:
+                data["gc_log"] = {"status": "absent"}
+            pending = git_path("dmr-object-maintenance.pending")
+            if os.path.lexists(pending):
+                info = os.lstat(pending)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                    raise ValueError("Maintenance recovery marker is unsafe or oversized")
+                with open(pending, "rb") as stream:
+                    content = stream.read(4097)
+                if len(content) != info.st_size:
+                    raise ValueError("Maintenance recovery marker changed during inspection")
+                data["pending_maintenance"] = {
+                    "status": "present", "size_bytes": info.st_size,
+                    "sha256": hashlib.sha256(content).hexdigest(), "mtime_ns": info.st_mtime_ns,
+                }
+            else:
+                data["pending_maintenance"] = {"status": "absent"}
+            data["maintenance_required"] = bool(
+                loose_count >= trigger or data["sampled_fanout_count"] > data["fanout_threshold"]
+                or counts["packs"] > limit > 0 or counts["garbage"] > 0
+                or data["gc_log"]["status"] != "absent"
+                or data["pending_maintenance"]["status"] != "absent"
+            )
+            data["complete"] = True
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+        data["unsupported_reasons"] = sorted(set(data["unsupported_reasons"]))
+        return data
+
     # --- push weight --------------------------------------------------------
     def pack_size_bytes(self) -> int:
         """Approx on-disk object size (loose + packed), in bytes."""
@@ -776,6 +1002,17 @@ def summarize_stashes(stash_lines: list[str], details: list[dict]) -> dict:
     }
 
 
+def resolved_merge_commit(state: dict) -> bool:
+    """Only a verified, fully resolved normal merge can finish via plain commit."""
+    return bool(
+        state.get("active_operations") == ["MERGE_HEAD"]
+        and state.get("merge_parents")
+        and not state.get("index_locked")
+        and state.get("status", {}).get("conflicts") == []
+        and state.get("index_inventory", {}).get("unmerged_paths") == []
+    )
+
+
 def compute_scores(state: dict) -> dict:
     st = state.get("status") or {}
     files = state.get("files") or []
@@ -849,7 +1086,7 @@ def compute_scores(state: dict) -> dict:
                           + ", ".join(repr(f["path"]) for f in protected[:5]))
     if any(f.get("huge") for f in recorded_files):
         sc = min(sc, 39)
-    if state.get("index_locked") or state.get("active_operations"):
+    if state.get("index_locked") or (state.get("active_operations") and not resolved_merge_commit(state)):
         sc = 0
         sc_reasons.append("Index lock or Git operation in progress; resolve its intended workflow first.")
     if st.get("detached"):
@@ -979,35 +1216,747 @@ def compute_scores(state: dict) -> dict:
 # operation-specific safety evidence (read-only; never performs the operation)
 # ----------------------------------------------------------------------------
 ACTION_SCOPES = {
+    "maintain_objects": "preservation-only git repack -a -d --cruft without expiration; no unreachable-object pruning or reflog expiry",
     "commit_index": "git commit of the inspected index (not -a, path arguments, or amend)",
+    "stage_paths": "read-only expansion and safety assessment of requested staging pathspecs",
     "discard_tracked": "git restore --worktree -- . (from the index; no submodule recursion)",
     "clean_untracked": "git clean -fd (not -x, -X, or a second -f)",
     "clean_ignored": "git clean -fdx (not a second -f)",
     "reset_hard": "git reset --hard <resolved target OID> (no submodule recursion)",
     "drop_stash": "git stash drop <selected stash ref> with committed-copy proof",
+    "create_branch": "nonforcing git switch --no-track -c <new local branch> <inspected HEAD OID>; no tree change",
+    "switch_branch": "git switch --no-guess --no-overwrite-ignore --no-recurse-submodules <existing local branch>",
+    "fast_forward": "on main, git -c submodule.recurse=false merge --ff-only --no-autostash --no-overwrite-ignore <resolved branch OID>",
+    "delete_branch": "on main, git branch -d -- <non-current integrated local branch>; never -D",
+    "push_origin": "git push --no-force --no-follow-tags --recurse-submodules=no origin <inspected main OID>:refs/heads/main",
+}
+REF_ACTIONS = ("create_branch", "switch_branch", "fast_forward", "delete_branch", "push_origin")
+REF_MAX_WORKTREE_ENTRIES = 50_000
+STATUS_FILTER_MAX_PATHS = 200_000
+STATUS_FILTER_BATCH_SIZE = 4096
+REF_MAX_AGE_SECONDS = 60
+
+
+def _maintenance_hazards(state: dict) -> list[str]:
+    storage = state.get("object_storage") or {}
+    reasons = []
+    if (storage.get("complete") is not True or storage.get("errors")
+            or not isinstance(storage.get("loose_count"), int)
+            or not isinstance(storage.get("loose_bytes"), int)
+            or storage.get("maintenance_required") is not True
+            or not storage.get("inventory_fingerprint") or not storage.get("config_fingerprint")
+            or not state.get("refs_fingerprint")):
+        reasons.append("Complete object-storage evidence and a real maintenance backlog are required.")
+    if storage.get("unsupported_reasons"):
+        reasons.append("Alternate, promisor, protected-pack, or unsupported Git configuration needs a separate preservation plan.")
+    if storage.get("garbage_count"):
+        reasons.append("Git reports garbage files; repacking cannot safely account for them.")
+    if (storage.get("gc_log") or {}).get("status") not in ("absent", "loose_unreachable_warning"):
+        reasons.append("Unrecognized gc.log evidence needs inspection; do not silence it.")
+    if (storage.get("pending_maintenance") or {}).get("status") != "absent":
+        reasons.append("An earlier maintenance attempt has an unresolved private recovery receipt.")
+    if state.get("extra_worktree_count") != 0:
+        reasons.append("Shared worktree object stores require separate coordination.")
+    gitdir = os.path.join(state.get("root") or "", ".git")
+    try:
+        if not stat.S_ISDIR(os.lstat(gitdir).st_mode):
+            raise OSError("linked, bare, or symlinked Git directory")
+        markers = ("HEAD.lock", "packed-refs.lock", "shallow.lock", "config.lock",
+                   "gc.pid", "objects/info/alternates.lock", "objects/pack/multi-pack-index.lock")
+        if any(os.path.lexists(os.path.join(gitdir, name)) for name in markers):
+            reasons.append("A Git writer or maintenance lock is present.")
+        def walk_error(exc):
+            raise exc
+        for folder in ("refs", "objects/pack", "objects"):
+            location = os.path.join(gitdir, folder)
+            if os.path.isdir(location):
+                for directory, dirs, files in os.walk(location, onerror=walk_error):
+                    if (any(name.endswith(".lock") for name in dirs + files)
+                            or (folder == "objects" and directory == location
+                                and any(name.startswith("tmp_obj") for name in files))):
+                        reasons.append("A Git ref or object writer lock is present.")
+                        break
+    except OSError:
+        reasons.append("The Git directory or writer-lock inventory is unsafe or unreadable.")
+    return reasons
+
+
+def _metadata_digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode()).hexdigest()
+
+
+def _ref_read(repo: GitRepo, *args, **kwargs) -> str:
+    out, rc, err = repo._run(*args, **kwargs)
+    # Warnings such as an ignored broken ref are incomplete evidence, even at rc=0.
+    # Do not relay stderr: Git configuration errors can contain remote credentials.
+    if rc or err:
+        raise ValueError(f"Git {args[0]} operation evidence failed or was incomplete.")
+    return out
+
+
+def _attribute_sources_fingerprint(repo: GitRepo) -> str:
+    if any(os.environ.get(key) for key in ("GIT_ATTR_NOSYSTEM", "GIT_ATTR_SOURCE")):
+        raise ValueError("Overridden attribute-source environments are not assessed.")
+    paths = [_ref_read(repo, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes").rstrip("\n")]
+    for name in ("GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"):
+        paths.append(_ref_read(repo, "var", name).rstrip("\n"))
+    inventory = {}
+    for value in paths:
+        if not value:
+            continue
+        path = os.path.abspath(os.path.join(repo.root, value))
+        if path != os.path.realpath(path):
+            raise ValueError("Symlinked external attribute metadata is not assessed.")
+        if not os.path.lexists(path):
+            inventory[path] = "absent"
+            continue
+        info = os.lstat(path)
+        if path == os.devnull:
+            inventory[path] = "null device"
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 16_000_000:
+            raise ValueError("External attribute metadata is unsafe or exceeds the bounded inventory.")
+        with open(path, "rb") as stream:
+            raw = stream.read(info.st_size + 1)
+        after = os.lstat(path)
+        if len(raw) != info.st_size or any(getattr(after, key) != getattr(info, key) for key in (
+                "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_dev", "st_ino")):
+            raise ValueError("External attribute metadata changed during inspection.")
+        inventory[path] = hashlib.sha256(raw).hexdigest()
+    return _metadata_digest(inventory)
+
+
+# The standard Git LFS driver exactly as `git lfs install` configures it. Only a
+# driver whose every configured command matches this definition is trusted; any
+# other driver, or an altered LFS command in any config scope, stays refused.
+TRUSTED_FILTER_DRIVERS = {
+    "lfs": {"clean": "git-lfs clean -- %f", "smudge": "git-lfs smudge -- %f",
+            "process": "git-lfs filter-process"},
 }
 
 
-def assess_action(state: dict, operation: str | None, target: str | None = None) -> dict:
+def _trusted_filter_drivers(config: str) -> set[str]:
+    """Driver names from NUL-delimited `git config --list` output that are trusted."""
+    commands: dict[str, list[tuple[str, str]]] = {}
+    for record in config.split("\0"):
+        key, separator, value = record.partition("\n")
+        if not separator or not key.startswith("filter."):
+            continue
+        name, _, field = key[7:].rpartition(".")
+        if field in ("clean", "smudge", "process"):
+            commands.setdefault(name, []).append((field, value))
+    return {name for name, configured in commands.items()
+            if name in TRUSTED_FILTER_DRIVERS
+            and all(value == TRUSTED_FILTER_DRIVERS[name][field] for field, value in configured)}
+
+
+def _checkout_filter_evidence(repo: GitRepo, paths: list[str], sources: list[str],
+                              trusted: frozenset[str] | set[str] = frozenset()) -> tuple[str, bool]:
+    """Git attribute metadata only. Never invoke a clean/smudge/process driver.
+
+    The boolean is true when every path is unfiltered or uses a trusted driver.
+    """
+    fingerprints, inactive = [], True
+    for source in [None, *dict.fromkeys(sources)]:
+        args = ["check-attr", "-z", "--stdin", "filter"]
+        if source is not None:
+            args.insert(1, "--source=" + source)
+        raw = _ref_read(repo, *args, input_text="\0".join(paths) + ("\0" if paths else ""))
+        fields = raw.split("\0")
+        if not fields or fields[-1] != "" or len(fields) != 3 * len(paths) + 1:
+            raise ValueError("Effective checkout attribute evidence is incomplete.")
+        for n, path in enumerate(paths):
+            row = fields[n * 3:n * 3 + 3]
+            if row[:2] != [path, "filter"]:
+                raise ValueError("Effective checkout attribute metadata is ambiguous.")
+            inactive = inactive and (row[2] in ("unspecified", "unset") or row[2] in trusted)
+        fingerprints.append(hashlib.sha256(raw.encode("utf-8", "surrogateescape")).hexdigest())
+    return _metadata_digest(fingerprints), inactive
+
+
+def _status_filter_preflight(repo: GitRepo, pathspecs: list[str] | None = None,
+                             visited: set[str] | None = None) -> None:
+    """Refuse executable clean/process filters before status or a staging preview.
+
+    An alternate object store does not sandbox a filter's filesystem/network I/O.
+    Check effective attributes without running a driver. Status also visits
+    populated submodules, so inspect their own configuration recursively.
+    """
+    visited = set() if visited is None else visited
+    root = os.path.realpath(repo.root)
+    if root in visited or len(visited) >= 128:
+        raise ValueError("Recursive filter metadata exceeds the bounded inventory.")
+    visited.add(root)
+    _readonly_index_admission(repo)
+    config = _ref_read(repo, "config", "--null", "--list")
+    if config and not config.endswith("\0"):
+        raise ValueError("Filter configuration metadata is incomplete.")
+    drivers = set()
+    for record in config.split("\0"):
+        if not record:
+            continue
+        key, separator, value = record.partition("\n")
+        if not separator:
+            raise ValueError("Filter configuration metadata is malformed.")
+        if key.startswith("filter.") and key.rsplit(".", 1)[-1] in ("clean", "process") and value:
+            drivers.add(key[7:].rsplit(".", 1)[0])
+    raw = _ref_read(repo, "ls-files", "--stage", "-z")
+    if raw and not raw.endswith("\0"):
+        raise ValueError("Filter index metadata is incomplete.")
+    paths, submodules = set(), set()
+    for entry in raw.split("\0"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition("\t")
+        if not separator or len(metadata.split()) != 3:
+            raise ValueError("Filter index metadata is malformed.")
+        paths.add(path)
+        if metadata.split()[0] == "160000":
+            submodules.add(path)
+    if pathspecs is not None:
+        candidates = _ref_read(repo, "ls-files", "--cached", "--others", "--exclude-standard",
+                               "-z", "--", *pathspecs)
+        if candidates and not candidates.endswith("\0"):
+            raise ValueError("Staging filter candidate metadata is incomplete.")
+        paths.update(path for path in candidates.split("\0") if path)
+    if drivers & {"unset", "unspecified"}:
+        raise ValueError("Reserved filter names make read-only attribute evidence ambiguous.")
+    # The standard Git LFS driver is trusted; every other active driver is refused.
+    drivers -= _trusted_filter_drivers(config)
+    if drivers:
+        if len(paths) > STATUS_FILTER_MAX_PATHS:
+            raise ValueError("Filter paths exceed the bounded inventory.")
+        ordered = sorted(paths)
+        # Ordinary status only needs filter metadata, not the richer bounded
+        # tree/collision inventory required by reference-changing operations.
+        # Cover every path in bounded requests; never sample or skip the tail.
+        for offset in range(0, len(ordered), STATUS_FILTER_BATCH_SIZE):
+            batch = ordered[offset:offset + STATUS_FILTER_BATCH_SIZE]
+            attributes = _ref_read(repo, "check-attr", "-z", "--stdin", "filter",
+                                   input_text="\0".join(batch) + "\0")
+            fields = attributes.split("\0")
+            if len(fields) != len(batch) * 3 + 1 or fields[-1] != "":
+                raise ValueError("Effective filter metadata is incomplete.")
+            for n, path in enumerate(batch):
+                row = fields[n * 3:n * 3 + 3]
+                if row[:2] != [path, "filter"]:
+                    raise ValueError("Effective filter metadata is ambiguous.")
+                if row[2] in drivers:
+                    raise ValueError("Active clean/process filters are outside read-only inspection; no driver was invoked.")
+    for path in submodules:
+        child = os.path.join(root, path)
+        if os.path.lexists(os.path.join(child, ".git")):
+            _status_filter_preflight(GitRepo(child), visited=visited)
+
+
+def _ref_inspection_preflight(repo: GitRepo) -> dict:
+    # Status can invoke clean/process filters on dirty tracked files. Ref-operation
+    # inspections refuse active filters before that read, not after a driver ran.
+    attributes = _attribute_sources_fingerprint(repo)
+    cfg = _ref_read(repo, "config", "--null", "--list")
+    if cfg and not cfg.endswith("\0"):
+        raise ValueError("Preflight configuration metadata is incomplete.")
+    for record in cfg.split("\0"):
+        if record:
+            key, sep, _ = record.partition("\n")
+            if not sep or not key or key.lower().endswith(".promisor"):
+                raise ValueError("Partial/unknown inspection metadata is not assessed.")
+            if key.lower().startswith(("filter.unset.", "filter.unspecified.")):
+                raise ValueError("Reserved attribute-state driver names make inactive-filter evidence ambiguous.")
+    head = _ref_read(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    tree = _operation_tree(repo, head)
+    raw = _ref_read(repo, "ls-files", "-z")
+    if raw and not raw.endswith("\0"):
+        raise ValueError("Preflight index paths are incomplete.")
+    paths = sorted(set(tree) | {path for path in raw.split("\0") if path})
+    if len(paths) > REF_MAX_WORKTREE_ENTRIES:
+        raise ValueError("Preflight attribute paths exceed the bounded inventory.")
+    fingerprint, inactive = _checkout_filter_evidence(repo, paths, [head], _trusted_filter_drivers(cfg))
+    if not inactive:
+        raise ValueError("Active or unresolved checkout filters are outside read-only ref inspection; no driver was invoked.")
+    return {"head_oid": head, "attribute_sources_fingerprint": attributes,
+            "effective_filters_fingerprint": fingerprint}
+
+
+def _worktree_metadata(root: str) -> dict:
+    """Bound filesystem names/types/stat data, not file contents or secret patterns."""
+    entries = {}
+    repo = GitRepo(root)
+    ignored_dirs = {path.rstrip("/") for path in _ref_read(
+        repo, "ls-files", "--others", "--ignored", "--directory", "--exclude-standard", "-z"
+    ).split("\0") if path.endswith("/")}
+    pending = [(root, "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as children:
+            for child in sorted(children, key=lambda entry: entry.name):
+                if not prefix and child.name in (".git", OUTPUT_DIRNAME):
+                    continue
+                path = prefix + child.name
+                if child.name == ".git":
+                    raise ValueError("Nested repository metadata is outside this operation's scope.")
+                info = child.stat(follow_symlinks=False)
+                if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+                        or stat.S_ISLNK(info.st_mode)):
+                    raise ValueError("A working path has an unsupported filesystem type.")
+                entries[path] = [info.st_mode, info.st_size, info.st_mtime_ns,
+                                 info.st_ctime_ns, info.st_dev, info.st_ino]
+                if len(entries) > REF_MAX_WORKTREE_ENTRIES:
+                    raise ValueError("Working-path metadata exceeds the bounded operation inventory.")
+                if stat.S_ISDIR(info.st_mode) and path not in ignored_dirs:
+                    pending.append((child.path, path + "/"))
+    return entries
+
+
+def _reflog_fingerprint(gitdirs: set[str]) -> str:
+    """Bind recovery metadata without publishing reflog identities/messages."""
+    inventory = {}
+    total = 0
+    for gitdir in sorted(gitdirs):
+        location = os.path.join(gitdir, "logs")
+        if not os.path.lexists(location):
+            continue
+        if not stat.S_ISDIR(os.lstat(location).st_mode):
+            raise ValueError("Reflog metadata must be an ordinary directory.")
+        def walk_error(exc):
+            raise exc
+        for folder, dirs, files in os.walk(location, followlinks=False, onerror=walk_error):
+            for name in dirs + files:
+                path = os.path.join(folder, name)
+                info = os.lstat(path)
+                if name.endswith(".lock") or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise ValueError("Recovery metadata has an unsafe type or writer lock.")
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                    if total > 16_000_000 or len(inventory) >= REF_MAX_WORKTREE_ENTRIES:
+                        raise ValueError("Recovery metadata exceeds the bounded operation inventory.")
+                    with open(path, "rb") as stream:
+                        raw = stream.read(info.st_size + 1)
+                    after = os.lstat(path)
+                    if len(raw) != info.st_size or any(getattr(after, key) != getattr(info, key) for key in (
+                            "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_dev", "st_ino")):
+                        raise ValueError("Reflog recovery metadata changed during inspection.")
+                    inventory[path] = hashlib.sha256(raw).hexdigest()
+    return _metadata_digest(inventory)
+
+
+def _ref_operation_inputs(repo: GitRepo, state: dict) -> tuple[dict, dict]:
+    """Reobserve the schema-2 inputs and add exact ref-operation bindings."""
+    root = state.get("root")
+    if (not isinstance(root, str) or root != os.path.realpath(root) or repo.toplevel() != root
+            or state.get("topology", {}).get("toplevel") != root):
+        raise ValueError("A canonical, actual repository root is required.")
+    st, index = state.get("status") or {}, state.get("index_inventory") or {}
+    if (not isinstance(state.get("read_errors"), list) or state["read_errors"]
+            or state.get("index_locked") is not False or state.get("active_operations") != []
+            or not isinstance(index.get("hidden_paths"), list) or index["hidden_paths"]
+            or not isinstance(index.get("unmerged_paths"), list) or index["unmerged_paths"]
+            or not isinstance(index.get("gitlinks"), list) or index["gitlinks"]
+            or type(st.get("detached")) is not bool or state.get("has_commits") is not True):
+        raise ValueError("Complete, conflict-free, visible non-submodule index/operation evidence is required.")
+    for name in ("staged", "modified", "conflicts", "untracked"):
+        if not isinstance(st.get(name), list):
+            raise ValueError("Working-tree status evidence is incomplete.")
+    if st["conflicts"]:
+        raise ValueError("Unmerged work must be reconciled before a ref operation.")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", st.get("oid") or ""):
+        raise ValueError("An inspected HEAD commit is required.")
+    paths = _ref_read(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").splitlines()
+    if len(paths) != 2:
+        raise ValueError("Git directory topology evidence is incomplete.")
+    gitdir, common = paths
+    for path in paths:
+        if path != os.path.realpath(path) or not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise ValueError("Git metadata directories must be ordinary canonical directories.")
+    for directory in {gitdir, common}:
+        for name in ("index.lock", "HEAD.lock", "packed-refs.lock", "config.lock", "shallow.lock",
+                     "FETCH_HEAD.lock", "ORIG_HEAD.lock", "gc.pid"):
+            if os.path.lexists(os.path.join(directory, name)):
+                raise ValueError("A Git writer or ref lock is present.")
+        location = os.path.join(directory, "refs")
+        if os.path.lexists(location):
+            if not stat.S_ISDIR(os.lstat(location).st_mode):
+                raise ValueError("The loose-ref directory is unsafe.")
+            def walk_error(exc):
+                raise exc
+            for folder, dirs, files in os.walk(location, followlinks=False, onerror=walk_error):
+                for name in dirs + files:
+                    info = os.lstat(os.path.join(folder, name))
+                    if name.endswith(".lock"):
+                        raise ValueError("A Git ref writer lock is present.")
+                    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                        raise ValueError("Loose-ref metadata contains an unsupported file type.")
+
+    cfg = _ref_read(repo, "config", "--null", "--list")
+    if cfg and not cfg.endswith("\0"):
+        raise ValueError("Git configuration evidence is truncated.")
+    config = {}
+    for record in cfg.split("\0"):
+        if record:
+            key, sep, value = record.partition("\n")
+            if not sep or not key:
+                raise ValueError("Git configuration evidence is malformed.")
+            config.setdefault(key, []).append(value)
+    if any(key.lower().endswith(".promisor") or key.lower().startswith("extensions.")
+           and key.lower() not in {"extensions.objectformat", "extensions.worktreeconfig"} for key in config):
+        raise ValueError("Partial-clone or unsupported repository extensions are not assessed.")
+    if "extensions.worktreeconfig" in config:
+        if _ref_read(repo, "config", "--bool", "--get", "extensions.worktreeconfig").strip() not in {"true", "false"}:
+            raise ValueError("Worktree configuration extension is not a known boolean.")
+    if _ref_read(repo, "rev-parse", "--is-shallow-repository").strip() != "false":
+        raise ValueError("Shallow-history operations are not assessed.")
+    if any(os.environ.get(key) for key in ("GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+                                           "GIT_SHALLOW_FILE", "GIT_NO_REPLACE_OBJECTS")):
+        raise ValueError("Operation evidence does not support overridden Git configuration/history inputs.")
+
+    refs, symrefs = {}, {}
+    raw = _ref_read(repo, "for-each-ref", "--format=%(refname)\t%(objectname)\t%(symref)")
+    if raw and not raw.endswith("\n"):
+        raise ValueError("Ref operation metadata is truncated.")
+    for row in raw.splitlines():
+        fields = row.split("\t")
+        if (len(fields) != 3 or fields[0] in refs
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[1])):
+            raise ValueError("Ref operation metadata is malformed.")
+        refs[fields[0]] = fields[1]
+        if fields[2]:
+            symrefs[fields[0]] = fields[2]
+    if _metadata_digest(refs) != state.get("refs_fingerprint"):
+        raise ValueError("Refs changed since the schema-2 inspection; refresh.")
+    preflight = _ref_inspection_preflight(repo)
+    if preflight != state.get("ref_inspection_preflight") or preflight["head_oid"] != st["oid"]:
+        raise ValueError("Bound effective attribute/HEAD inspection inputs changed; refresh.")
+    if repo.status() != st or repo.index_inventory() != index:
+        raise ValueError("HEAD, working-tree status or index changed since inspection; refresh.")
+    markers = repo.operation_markers()
+    if any(state.get(key) != value for key, value in markers.items()):
+        raise ValueError("Git operation state changed since inspection; refresh.")
+    worktrees = repo.worktrees()
+    if not isinstance(state.get("worktrees"), list) or worktrees != state["worktrees"] or not worktrees:
+        raise ValueError("Worktree occupancy evidence is missing or changed; refresh.")
+    primary = []
+    for worktree in worktrees:
+        if (not isinstance(worktree.get("path"), str) or not os.path.isdir(worktree["path"])
+                or worktree.get("bare") or worktree.get("prunable")
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", worktree.get("HEAD") or "")
+                or not (isinstance(worktree.get("branch"), str) or worktree.get("detached") is True)):
+            raise ValueError("Worktree occupancy metadata is incomplete or stale.")
+        held = worktree.get("branch")
+        if held and (not held.startswith("refs/heads/") or held in symrefs or refs.get(held) != worktree["HEAD"]):
+            raise ValueError("Worktree branch/ref identity is incomplete or ambiguous.")
+        if os.path.realpath(worktree["path"]) == root:
+            primary.append(worktree)
+    if len(primary) != 1 or primary[0]["HEAD"] != st["oid"]:
+        raise ValueError("The current worktree/HEAD identity is not proven.")
+    head_ref = primary[0].get("branch")
+    if head_ref != (None if st["detached"] else "refs/heads/" + (st.get("branch") or "")):
+        raise ValueError("The symbolic HEAD and branch evidence disagree.")
+    storage = repo.object_storage()
+    if storage.get("complete") is not True or storage != state.get("object_storage"):
+        raise ValueError("Object/configuration evidence is incomplete or changed; refresh.")
+    unsupported_storage = set(storage.get("unsupported_reasons", []))
+    worktree_config_only = (
+        unsupported_storage == {"unsupported object-storage Git configuration"}
+        and "extensions.worktreeconfig" in config
+        and not any(key.lower().startswith("repack.") for key in config)
+    )
+    if unsupported_storage and not worktree_config_only:
+        raise ValueError("Alternate/promisor/protected object storage is outside this operation's scope.")
+    if hashlib.sha256(cfg.encode("utf-8", "surrogateescape")).hexdigest() != storage.get("config_fingerprint"):
+        raise ValueError("Git configuration changed since inspection; refresh.")
+    index_path = _ref_read(repo, "rev-parse", "--path-format=absolute", "--git-path", "index").rstrip("\n")
+    if index_path != os.path.realpath(index_path) or not stat.S_ISREG(os.lstat(index_path).st_mode):
+        raise ValueError("The real index must be an ordinary canonical file.")
+    with open(index_path, "rb") as stream:
+        index_bytes = stream.read()
+    working = _worktree_metadata(root)
+    tracked = _ref_read(repo, "ls-files", "-z").split("\0")
+    if any(path == OUTPUT_DIRNAME or path.startswith(OUTPUT_DIRNAME + "/") for path in tracked):
+        raise ValueError("Tracked assessment-publication paths cannot be excluded from operation bindings.")
+    if repo.read_errors:
+        raise ValueError("A required operation metadata inventory failed.")
+    inputs = {
+        "root": root, "gitdir": gitdir, "common_gitdir": common,
+        "engine_source_sha256": state.get("engine_source_sha256"),
+        "inspection_preflight": preflight,
+        "head_ref": head_ref, "head_oid": st["oid"],
+        "index_fingerprint": index["fingerprint"],
+        "index_file_sha256": hashlib.sha256(index_bytes).hexdigest(),
+        "refs_fingerprint": state["refs_fingerprint"], "symrefs_fingerprint": _metadata_digest(symrefs),
+        "reflogs_fingerprint": _reflog_fingerprint({gitdir, common}),
+        "worktrees_fingerprint": _metadata_digest(worktrees),
+        "worktree_fingerprint": _metadata_digest(working),
+        "config_fingerprint": storage["config_fingerprint"],
+        "object_inventory_fingerprint": storage["inventory_fingerprint"],
+    }
+    return inputs, {"refs": refs, "symrefs": symrefs, "working": working, "config": config}
+
+
+def _branch_recovery_tips(repo: GitRepo, target: str) -> list[str]:
+    path = _ref_read(repo, "rev-parse", "--path-format=absolute", "--git-path", "logs/" + target).rstrip("\n")
+    if not os.path.lexists(path):
+        return []
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError("Selected branch recovery metadata is unsafe.")
+    with open(path, "rb") as stream:
+        raw = stream.read(16_000_001)
+    if len(raw) > 16_000_000 or raw and not raw.endswith(b"\n"):
+        raise ValueError("Selected branch recovery metadata is oversized or truncated.")
+    tips = set()
+    for row in raw.splitlines():
+        fields = row.split(b" ", 2)
+        if len(fields) != 3 or any(not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) for oid in fields[:2]):
+            raise ValueError("Selected branch recovery OID metadata is malformed.")
+        tips.update(oid.decode("ascii") for oid in fields[:2] if set(oid) != {ord("0")})
+    return sorted(tips)
+
+
+def _operation_tree(repo: GitRepo, oid: str) -> dict:
+    entries = {}
+    raw = _ref_read(repo, "ls-tree", "-r", "-z", "--full-tree", oid)
+    if raw and not raw.endswith("\0"):
+        raise ValueError("Operation tree metadata is truncated.")
+    for row in raw.split("\0"):
+        if not row:
+            continue
+        meta, sep, path = row.partition("\t")
+        fields = meta.split()
+        if (not sep or len(fields) != 3 or path in entries or fields[1] != "blob"
+                or fields[0] not in ("100644", "100755", "120000")
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[2])
+                or path.startswith("/") or any(p in ("", ".", "..", ".git", OUTPUT_DIRNAME) for p in path.split("/"))):
+            raise ValueError("Unsupported, submodule or malformed target-tree metadata.")
+        entries[path] = (fields[0], fields[2])
+    return entries
+
+
+def _checkout_collisions(root: str, head: dict, target: dict, working: dict) -> bool:
+    for path, entry in target.items():
+        if head.get(path) == entry:
+            continue
+        parts = path.split("/")
+        # Existing HEAD leaves are proven clean before this function is used.
+        # Everything else, including ignored files and symlinks, is local work.
+        for n in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:n])
+            info = working.get(prefix)
+            exists = os.path.lexists(os.path.join(root, prefix))
+            if not exists:
+                continue
+            if info is None:  # Includes case-folded filesystem aliases.
+                return True
+            if stat.S_ISDIR(info[0]) and os.path.lexists(os.path.join(root, prefix, ".git")):
+                return True  # Never write across an opaque ignored repository boundary.
+            if n == len(parts):
+                if prefix not in head or stat.S_ISDIR(info[0]):
+                    return True
+            elif not stat.S_ISDIR(info[0]) and not (prefix in head and prefix not in target):
+                return True
+    return False
+
+
+def _assess_ref_action(state: dict, operation: str, target: str | None,
+                       expected_binding: str | None) -> tuple[list[str], dict]:
+    reasons, evidence = [], {"input_binding": None, "binding_inputs": None}
+    try:
+        if type(state.get("schema_version")) is not int:
+            raise ValueError("Schema version must be the explicit integer schema-2 value.")
+        stamp = datetime.fromisoformat(state.get("generated_at") or "")
+        age = (datetime.now(timezone.utc) - stamp).total_seconds() if stamp.tzinfo else -1
+        if not 0 <= age <= REF_MAX_AGE_SECONDS:
+            raise ValueError("Operation evidence is stale or has no timezone; refresh within 60 seconds.")
+        if (not isinstance(state.get("request_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", state["request_id"])
+                or not isinstance(state.get("publication_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{32}", state["publication_id"])
+                or state.get("engine_source_sha256") != ENGINE_SOURCE_SHA256):
+            raise ValueError("Fresh request/publication/source correlation is required.")
+        if not isinstance(target, str) or not target.startswith("refs/heads/"):
+            raise ValueError("Select one exact fully qualified local branch ref: refs/heads/<name>.")
+        branch = target[len("refs/heads/"):]
+        repo = GitRepo(state["root"])
+        if (not branch or branch.startswith(("-", "refs/")) or "\0" in target
+                or branch in {"HEAD", "@", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+                              "REVERT_HEAD", "AUTO_MERGE", "BISECT_HEAD"}
+                or re.fullmatch(r"[0-9a-fA-F]{40,64}", branch)):
+            raise ValueError("The target is not an unambiguous supported local branch name.")
+        _ref_read(repo, "check-ref-format", target)
+        if _ref_read(repo, "check-ref-format", "--branch", branch).strip() != branch:
+            raise ValueError("Git branch-name expansion is not an exact local target.")
+        evidence.update(target_ref=target, branch_name=branch)
+        inputs = state.get("ref_operation_inputs")
+        if not isinstance(inputs, dict) or not inputs:
+            raise ValueError("; ".join(state.get("ref_operation_errors") or [
+                "Operation input bindings are missing; request a fresh operation-specific snapshot."]))
+        current, details = _ref_operation_inputs(repo, state)
+        if current != inputs:
+            raise ValueError("Bound Git/worktree inputs changed since inspection; refresh.")
+        refs, config = details["refs"], details["config"]
+        head = inputs["head_oid"]
+        target_oid = refs.get(target)
+        evidence.update(resolved_target=target_oid, target_oid=target_oid,
+                        retained_oid=head if operation == "delete_branch" else None)
+        if target in details["symrefs"]:
+            raise ValueError("Symbolic branch aliases are ambiguous operation targets.")
+        commits = [w["HEAD"] for w in state["worktrees"]]
+        if state["status"]["detached"] and operation != "create_branch":
+            reasons.append("Retain detached HEAD on a named branch before switching away or reconciling refs.")
+        if operation == "create_branch":
+            if (any(ref == target or ref.startswith(target + "/") or target.startswith(ref + "/")
+                    or ref.casefold() == target.casefold() for ref in refs)
+                    or os.path.lexists(os.path.join(inputs["common_gitdir"], target))
+                    or any(key.startswith("branch." + branch + ".") for key in config)):
+                reasons.append("The new branch collides with an existing ref/namespace or branch configuration.")
+            evidence["resolved_target"] = head
+            evidence["target_oid"] = head
+        else:
+            if not target_oid:
+                raise ValueError("The exact local target branch does not exist.")
+            commits.append(target_oid)
+            if operation in ("switch_branch", "delete_branch") and any(
+                    w.get("branch") == target for w in state["worktrees"]
+                    if os.path.realpath(w["path"]) != state["root"]):
+                reasons.append("Another worktree holds the target branch; occupancy cannot be bypassed.")
+        if operation in ("fast_forward", "delete_branch", "push_origin") and inputs["head_ref"] != "refs/heads/main":
+            reasons.append("This bounded operation requires the inspected current main branch.")
+        if operation in ("switch_branch", "fast_forward"):
+            st = state["status"]
+            if st["staged"] or st["modified"]:
+                reasons.append("Switch/integration supports only a clean tracked worktree and index; preserve dirty work first.")
+            before, after = _operation_tree(repo, head), _operation_tree(repo, target_oid)
+            attribute_paths = sorted(before.keys() | after.keys())
+            trusted = _trusted_filter_drivers(_ref_read(repo, "config", "--null", "--list"))
+            attribute_fingerprint, inactive = _checkout_filter_evidence(
+                repo, attribute_paths, [head, target_oid], trusted)
+            evidence["checkout_attributes_fingerprint"] = attribute_fingerprint
+            if not inactive:
+                reasons.append("Active or unresolved checkout filters require a separate preservation assessment.")
+            if _checkout_collisions(state["root"], before, after, details["working"]):
+                reasons.append("The target may overwrite a local untracked/ignored path or filesystem alias.")
+        if operation == "fast_forward" and config.get("branch.main.mergeoptions"):
+            reasons.append("Configured main merge options are outside the exact fast-forward-only scope.")
+        if operation == "delete_branch":
+            recovery_tips = _branch_recovery_tips(repo, target)
+            commits.extend(recovery_tips)
+            evidence["recovery_tip_count"] = len(recovery_tips)
+            if target == inputs["head_ref"]:
+                reasons.append("The current branch cannot be deleted.")
+            upstream = _ref_read(repo, "for-each-ref", "--format=%(upstream)", target).rstrip("\n")
+            evidence["upstream_ref"] = upstream or None
+            configured = any(key in config for key in ("branch." + branch + ".remote", "branch." + branch + ".merge"))
+            if configured and not upstream:
+                reasons.append("The branch's configured deletion upstream is unresolved.")
+            if upstream:
+                if upstream not in refs or upstream in details["symrefs"]:
+                    raise ValueError("The deletion upstream is not an exact known local ref.")
+                commits.append(refs[upstream])
+        if operation == "push_origin":
+            if target != "refs/heads/main" or target_oid != head:
+                reasons.append("Only the inspected main tip may be pushed to origin/main.")
+            fetch = _ref_read(repo, "remote", "get-url", "--all", "origin").splitlines()
+            push = _ref_read(repo, "remote", "get-url", "--push", "--all", "origin").splitlines()
+            if len(fetch) != 1 or push != fetch or not fetch[0]:
+                raise ValueError("Exactly one existing origin destination matching its fetch URL is required.")
+            url = fetch[0]
+            scheme = re.match(r"^([a-z][a-z0-9+.-]*)://", url, re.I)
+            if (scheme and scheme[1].lower() not in ("https", "http", "ssh", "git", "file")
+                    or not scheme and ("::" in url or url.startswith("-") or any(c.isspace() for c in url))):
+                raise ValueError("The existing origin uses an unsupported transport form.")
+            if any(v.lower() not in ("false", "no", "off", "0") for v in config.get("remote.origin.mirror", [])):
+                reasons.append("Mirror push configuration is outside the single nonforcing ref scope.")
+            if any(v not in ("main", "main:main", "refs/heads/main:refs/heads/main")
+                   for v in config.get("remote.origin.push", [])):
+                reasons.append("Broad or forcing configured origin push refspecs are not assessed.")
+            tracking = "refs/remotes/origin/main"
+            mappings = config.get("remote.origin.fetch", [])
+            supported = ("refs/heads/*:refs/remotes/origin/*", "refs/heads/main:refs/remotes/origin/main")
+            if len(mappings) != 1 or mappings[0].removeprefix("+") not in supported:
+                raise ValueError("The existing origin must have one unambiguous main-to-origin/main tracking mapping.")
+            remote_oid = refs.get(tracking)
+            if not remote_oid or tracking in details["symrefs"]:
+                raise ValueError("Exact existing origin/main local tracking commit evidence is required; no live remote state is inferred.")
+            commits.append(remote_oid)
+            evidence.update(remote="origin", destination_ref="refs/heads/main", tracking_ref=tracking,
+                            origin_main_oid=remote_oid, remote_verification="LOCAL_TRACKING_REFS_ONLY",
+                            remote_verified=False, origin_url_sha256=hashlib.sha256(url.encode("utf-8", "surrogateescape")).hexdigest())
+        unique = sorted(set(commits))
+        objects = _ref_read(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                            input_text="\n".join(unique) + "\n").splitlines()
+        if objects != [oid + " commit" for oid in unique]:
+            raise ValueError("All inspected history tips must be complete commit objects.")
+        def ancestor(base, tip, reason):
+            _, rc, err = repo._run("merge-base", "--is-ancestor", base, tip)
+            if rc == 1 and not err:
+                reasons.append(reason)
+            elif rc or err:
+                raise ValueError("Required ancestry evidence failed; no integration/publication is inferred.")
+        if operation == "fast_forward":
+            ancestor(head, target_oid, "The target is not a fast-forward of the inspected HEAD; divergence/rewind is blocked.")
+        elif operation == "delete_branch":
+            ancestor(target_oid, head, "The branch history is not proven reachable from retained main.")
+            for tip in recovery_tips:
+                ancestor(tip, head, "Selected branch reflog recovery history is not reachable from retained main; preserve it.")
+            if evidence.get("upstream_ref"):
+                ancestor(target_oid, refs[evidence["upstream_ref"]], "Nonforcing git branch -d would reject the configured upstream; preserve the branch.")
+        elif operation == "push_origin":
+            ancestor(evidence["origin_main_oid"], head, "Main does not fast-forward the local origin/main tracking tip; nonforcing push is unproven.")
+        final, _ = _ref_operation_inputs(repo, state)
+        if final != inputs:
+            raise ValueError("Operation inputs changed during target inspection; refresh.")
+        binding = "sha256:" + _metadata_digest({
+            "operation": operation, "target": target, "inputs": inputs,
+            "checkout_attributes_fingerprint": evidence.get("checkout_attributes_fingerprint"),
+        })
+        evidence.update(input_binding=binding, binding_inputs=inputs,
+                        refs_fingerprint=inputs["refs_fingerprint"], config_fingerprint=inputs["config_fingerprint"],
+                        worktree_fingerprint=inputs["worktree_fingerprint"], request_id=state["request_id"],
+                        generated_at=state["generated_at"])
+        if expected_binding is not None and (not isinstance(expected_binding, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_binding) or expected_binding != binding):
+            reasons.append("Expected operation binding is malformed or stale; no action is approved.")
+    except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
+        reasons.append(str(exc))
+    return reasons, evidence
+
+
+def assess_action(state: dict, operation: str | None, target: str | None = None,
+                  expected_binding: str | None = None) -> dict:
     """Hard preservation predicates. A summary score is never action approval."""
-    st = state.get("status") or {}
+    st = state.get("status") if isinstance(state.get("status"), dict) else {}
+    index = state.get("index_inventory") if isinstance(state.get("index_inventory"), dict) else {}
+    topology = state.get("topology") if isinstance(state.get("topology"), dict) else {}
+    storage = state.get("object_storage") if isinstance(state.get("object_storage"), dict) else {}
     reasons = []
     resolved_target = None
+    evidence = {}
     if operation not in ACTION_SCOPES:
         reasons.append("An explicit supported operation is required; no blanket discard approval exists.")
     if (state.get("schema_version") != SCHEMA_VERSION or state.get("is_repo") is not True
             or state.get("read_complete") is not True or state.get("read_errors")
             or st.get("ok") is not True or st.get("complete") is not True):
         reasons.append("Required Git evidence is missing, failed, or incomplete.")
-    if state.get("topology", {}).get("kind") != "own_repo":
+    if topology.get("kind") != "own_repo":
         reasons.append("Request the actual repository root; this path has ambiguous action scope.")
-    if state.get("index_locked") or state.get("active_operations"):
+    if operation in REF_ACTIONS and any(not isinstance(state.get(key), dict) for key in (
+            "status", "index_inventory", "topology", "object_storage")):
+        reasons.append("Required schema-2 operation metadata has an invalid type.")
+    if state.get("index_locked") or (state.get("active_operations") and not (
+            operation == "commit_index" and resolved_merge_commit(state))):
         reasons.append("An index lock or unfinished Git operation requires reconciliation first.")
-    if operation not in ("reset_hard", "drop_stash") and target is not None:
+    if operation not in ("reset_hard", "drop_stash", *REF_ACTIONS) and target is not None:
         reasons.append("This operation does not accept a target.")
+    if expected_binding is not None and operation not in REF_ACTIONS:
+        reasons.append("Expected bindings are supported only for exact branch/integration/origin-push assessments.")
     if not reasons:
-        hidden = state.get("index_inventory", {}).get("hidden_paths")
-        if operation == "commit_index":
+        hidden = index.get("hidden_paths")
+        if operation in REF_ACTIONS:
+            ref_reasons, evidence = _assess_ref_action(state, operation, target, expected_binding)
+            reasons.extend(ref_reasons)
+            resolved_target = evidence.get("resolved_target")
+        elif operation == "maintain_objects":
+            reasons.extend(_maintenance_hazards(state))
+        elif operation == "commit_index":
             scores = state.get("scores") or {}
             if not st.get("staged"):
                 reasons.append("No staged changes; this is a preview, not a commit approval.")
@@ -1055,10 +2004,313 @@ def assess_action(state: dict, operation: str | None, target: str | None = None)
         "safe": safe, "decision": "ALLOW" if safe else "BLOCK",
         "reasons": reasons or ["No detected data-loss hazard within this exact operation's scope."],
         "root": state.get("root"), "head_oid": st.get("oid"),
-        "index_fingerprint": state.get("index_inventory", {}).get("fingerprint"),
+        "index_fingerprint": index.get("fingerprint"),
+        "refs_fingerprint": state.get("refs_fingerprint") if operation == "maintain_objects" else None,
+        "object_inventory_fingerprint": storage.get("inventory_fingerprint") if operation == "maintain_objects" else None,
+        "config_fingerprint": storage.get("config_fingerprint") if operation == "maintain_objects" else None,
+        "gc_log": storage.get("gc_log") if operation == "maintain_objects" else None,
+        "pending_maintenance": storage.get("pending_maintenance") if operation == "maintain_objects" else None,
+        "merge_parents": state.get("merge_parents", []) if operation == "commit_index" else [],
         "publication_id": state.get("publication_id"),
         "limits": "Snapshot evidence, not execution authorization, a backup, a secret scan, or protection against future concurrent writes.",
+        **evidence,
     }
+
+
+def requested_action(state: dict, operation: str, target: str | None = None,
+                     expected_binding: str | None = None) -> dict:
+    action = assess_action(state, operation, target, expected_binding)
+    state.setdefault("actions", {})[operation] = action
+    state["requested_action"] = action
+    return state
+
+
+
+def _absolute_git_path(repo: GitRepo, name: str) -> str:
+    out, rc, err = repo._run("rev-parse", "--git-path", name)
+    if rc or not out.strip():
+        raise RuntimeError(err.strip() or f"could not resolve Git path {name}")
+    value = out.strip()
+    if not os.path.isabs(value):
+        value = os.path.join(repo.root, value)
+    return os.path.realpath(value)
+
+
+def _index_entries(repo: GitRepo) -> dict[str, tuple[str, str, str]]:
+    out, rc, err = repo._run("ls-files", "--stage", "-z")
+    if rc:
+        raise RuntimeError(err.strip() or "could not read index entries")
+    if out and not out.endswith("\0"):
+        raise RuntimeError("incomplete index entry metadata")
+    entries = {}
+    seen = set()
+    for row in out.split("\0"):
+        if not row:
+            continue
+        meta, sep, path = row.partition("\t")
+        fields = meta.split()
+        if (not sep or len(fields) != 3 or not path or os.path.isabs(path)
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or fields[0] not in ("100644", "100755", "120000", "160000")
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[1])
+                or fields[2] not in ("0", "1", "2", "3") or (path, fields[2]) in seen):
+            raise RuntimeError("malformed index entry")
+        seen.add((path, fields[2]))
+        entries[path] = (fields[0], fields[1], fields[2])
+    return entries
+
+
+def _index_fingerprint(repo: GitRepo) -> str:
+    out, rc, err = repo._run("ls-files", "--stage", "-v", "-z")
+    if rc:
+        raise RuntimeError(err.strip() or "could not fingerprint index")
+    if out and not out.endswith("\0"):
+        raise RuntimeError("incomplete index fingerprint metadata")
+    return hashlib.sha256(out.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _head_oid(repo: GitRepo) -> str | None:
+    out, rc, _ = repo._run("rev-parse", "--verify", "HEAD")
+    value = out.strip()
+    return value if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", value) else None
+
+
+def _environment_matches(key: str, value: str, expected: str) -> bool:
+    if key == "GIT_ALTERNATE_OBJECT_DIRECTORIES":
+        return value == expected
+    return os.path.normcase(os.path.realpath(value)) == os.path.normcase(os.path.realpath(expected))
+
+
+def _reported_stage_pathspec(value: object) -> str:
+    if not isinstance(value, str):
+        return "<non-text pathspec>"
+    try:
+        encoded = value.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return "<unencodable pathspec>"
+    if len(encoded) <= STAGE_MAX_PATH_BYTES:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"<oversized pathspec bytes={len(encoded)} sha256:{digest}>"
+
+
+def _stage_result(state: dict, action: dict) -> dict:
+    # The result names its own publication; retain original-input lineage too.
+    action = {**action, "publication_id": state.get("publication_id")}
+    state.setdefault("actions", {})["stage_paths"] = action
+    state["requested_action"] = action
+    return state
+
+
+def _readonly_index_admission(repo: GitRepo) -> None:
+    # Reading a split index can freshen a shared index in the real Git directory.
+    # Refuse it before build_state or any index-reading command. Retained shared
+    # metadata is deliberately conservative evidence, not proof it is active.
+    setting, code, error = repo._run("config", "--bool", "--get", "core.splitIndex")
+    if code not in (0, 1) or (code == 0 and setting.strip() != "false") or (code == 1 and setting):
+        raise RuntimeError("Split-index configuration is enabled or unreadable; read-only inspection is not admitted.")
+    index_path = _absolute_git_path(repo, "index")
+    with os.scandir(os.path.dirname(index_path)) as entries:
+        for count, entry in enumerate(entries):
+            if count >= STAGE_MAX_METADATA_ENTRIES:
+                raise RuntimeError("Index-directory metadata exceeds the bounded read-only admission inventory.")
+            if entry.name.startswith("sharedindex."):
+                raise RuntimeError("Retained shared-index metadata is outside read-only inspection isolation; preserve it for separate review.")
+
+
+def _stage_storage_admission(repo: GitRepo) -> None:
+    # Keep the staging admission entrypoint while sharing the read-side boundary.
+    _readonly_index_admission(repo)
+
+
+def stage_paths_state(root: str, pathspecs: list[str], quick: bool = True,
+                      request_id: str | None = None) -> dict:
+    """Assess a candidate index without executing the resulting staging manifest."""
+    root = os.path.realpath(os.path.abspath(root))
+    real_state = {
+        "version": VERSION, "schema_version": SCHEMA_VERSION, "root": root,
+        "request_id": request_id, "publication_id": os.urandom(16).hex(),
+        "is_repo": False, "read_complete": False,
+        "read_errors": ["Staging request was not admitted for repository inspection."],
+        "actions": {},
+    }
+    valid_sequence = isinstance(pathspecs, (list, tuple))
+    requested = pathspecs if valid_sequence else []
+    base_action = {
+        "operation": "stage_paths", "target": None, "resolved_target": None,
+        "scope": ACTION_SCOPES["stage_paths"], "safe": False, "decision": "BLOCK",
+        "reasons": [], "root": root, "head_oid": None, "index_fingerprint": None,
+        "baseline_publication_id": None,
+        "limits": (
+            "Read-only simulation in an isolated index/object directory. "
+            "The manifest is not execution authorization and does not lock future writers."
+        ),
+        "requested_pathspecs": [_reported_stage_pathspec(value)
+                                for value in requested[:STAGE_MAX_REPORTED_PATHS]],
+        "requested_pathspecs_truncated": max(0, len(requested) - STAGE_MAX_REPORTED_PATHS),
+        "manifest": [], "manifest_digest": None, "candidate_count": 0, "candidate_bytes": 0,
+    }
+    reasons = []
+    if not valid_sequence or not requested:
+        reasons.append("At least one staging pathspec in a list or tuple is required.")
+    if len(requested) > STAGE_MAX_REQUEST_PATHS:
+        reasons.append(f"Staging request exceeds the implementation ceiling of {STAGE_MAX_REQUEST_PATHS} pathspecs.")
+    else:
+        for pathspec in requested:
+            if not isinstance(pathspec, str) or not pathspec or "\0" in pathspec:
+                reasons.append("Every staging pathspec must be non-empty bounded text.")
+                continue
+            try:
+                encoded = pathspec.encode("utf-8", "surrogateescape")
+            except UnicodeEncodeError:
+                reasons.append("Staging pathspec cannot be represented as filesystem bytes.")
+                continue
+            if len(encoded) > STAGE_MAX_PATH_BYTES:
+                reasons.append(f"Staging pathspec exceeds the implementation ceiling of {STAGE_MAX_PATH_BYTES} bytes "
+                               f"(sha256:{hashlib.sha256(encoded).hexdigest()}).")
+                continue
+            if os.path.isabs(pathspec):
+                reasons.append(f"Absolute staging pathspec is not supported: {pathspec!r}.")
+            if pathspec.startswith("-"):
+                reasons.append(f"Staging options are not pathspecs: {pathspec!r}.")
+    if reasons:
+        base_action["reasons"] = list(dict.fromkeys(reasons))
+        return _stage_result(real_state, base_action)
+    try:
+        real_repo = GitRepo(root)
+        _stage_storage_admission(real_repo)
+        real_state = build_state(real_repo, {"quick": quick, "request_id": request_id})
+        base_action.update(
+            head_oid=(real_state.get("status") or {}).get("oid") if real_state.get("has_commits") else None,
+            index_fingerprint=(real_state.get("index_inventory") or {}).get("fingerprint"),
+            baseline_publication_id=real_state.get("publication_id"),
+        )
+        if (real_state.get("read_complete") is not True or real_state.get("read_errors")
+                or real_state.get("is_repo") is not True
+                or (real_state.get("topology") or {}).get("kind") != "own_repo"
+                or real_state.get("root") != root):
+            raise RuntimeError("A complete read of the actual repository root is required for staging preview.")
+        return _stage_paths_preview(real_repo, real_state, base_action, list(requested), quick, request_id)
+    except (OSError, ValueError, RuntimeError) as exc:
+        base_action["reasons"] = [str(exc) or "Staging preview failed before a complete result."]
+        return _stage_result(real_state, base_action)
+
+
+def _stage_paths_preview(real_repo: GitRepo, real_state: dict, base_action: dict,
+                         pathspecs: list[str], quick: bool, request_id: str | None) -> dict:
+    root = real_repo.root
+    _status_filter_preflight(real_repo, pathspecs)
+    real_index = _absolute_git_path(real_repo, "index")
+    real_objects = _absolute_git_path(real_repo, "objects")
+    before_entries = _index_entries(real_repo)
+    before_fingerprint = _index_fingerprint(real_repo)
+    before_head = _head_oid(real_repo)
+    if (before_fingerprint != base_action["index_fingerprint"]
+            or before_head != base_action["head_oid"]):
+        raise RuntimeError("The real index or HEAD changed after the baseline inspection; refresh.")
+
+    with tempfile.TemporaryDirectory(prefix="gitreal-stage-") as temp:
+        temp_index = os.path.join(temp, "index")
+        temp_objects = os.path.join(temp, "objects")
+        temp_hooks = os.path.join(temp, "hooks")
+        os.makedirs(temp_objects, mode=0o700)
+        os.makedirs(temp_hooks, mode=0o700)
+        if os.path.isfile(real_index):
+            shutil.copy2(real_index, temp_index)
+
+        # Never give the object-writing phase an alternate pointing at real objects:
+        # Git may freshen matching alternate objects. Each repo instance owns its
+        # effective environment; another caller never sees temporary process globals.
+        environment = dict(os.environ)
+        for key in ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+            environment.pop(key, None)
+        write_environment = {**environment, "GIT_INDEX_FILE": temp_index, "GIT_OBJECT_DIRECTORY": temp_objects}
+        read_environment = {**environment, "GIT_INDEX_FILE": temp_index,
+                            "GIT_OBJECT_DIRECTORY": real_objects,
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": temp_objects}
+        sim_repo = GitRepo(root, git_environment=write_environment)
+        if (_index_fingerprint(sim_repo) != before_fingerprint
+                or _index_fingerprint(real_repo) != before_fingerprint
+                or _head_oid(real_repo) != before_head):
+            raise RuntimeError("The copied candidate does not match the inspected index/HEAD; refresh.")
+        _, add_rc, add_err = sim_repo._run("-c", "core.hooksPath=" + temp_hooks,
+                                         "-c", "core.splitIndex=false", "add", "--", *pathspecs, timeout=120)
+        if add_rc:
+            raise RuntimeError("Git could not expand the requested pathspecs in the isolated staging simulation: "
+                               + (add_err.strip() or f"exit {add_rc}"))
+
+        # Only read operations follow. Both old and candidate objects are visible.
+        sim_repo.git_environment = dict(read_environment)
+        sim_state = build_state(sim_repo, {
+            "quick": quick, "request_id": request_id,
+            "_allowed_git_environment": {key: read_environment[key] for key in
+                                         ("GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")},
+        })
+        after_entries = _index_entries(sim_repo)
+        after_fingerprint = _index_fingerprint(sim_repo)
+        if (after_fingerprint != (sim_state.get("index_inventory") or {}).get("fingerprint")
+                or (sim_state.get("status") or {}).get("oid") != (real_state.get("status") or {}).get("oid")):
+            raise RuntimeError("Candidate index or HEAD changed after its inspection; refresh.")
+        changed_paths = sorted(path for path in set(before_entries) | set(after_entries)
+                               if before_entries.get(path) != after_entries.get(path))
+        if len(changed_paths) > STAGE_MAX_MANIFEST_ENTRIES:
+            base_action.update(candidate_count=len(changed_paths), reasons=[
+                f"Expanded staging manifest exceeds the implementation ceiling of {STAGE_MAX_MANIFEST_ENTRIES} entries."])
+            return _stage_result(sim_state, base_action)
+        oversized_paths = [path for path in changed_paths
+                           if len(path.encode("utf-8", "surrogateescape")) > STAGE_MAX_PATH_BYTES]
+        if oversized_paths:
+            base_action.update(candidate_count=len(changed_paths), reasons=[
+                f"{len(oversized_paths)} expanded path(s) exceed the {STAGE_MAX_PATH_BYTES}-byte implementation ceiling."])
+            return _stage_result(sim_state, base_action)
+        status_by_path = {item.get("path"): item for item in
+                          (sim_state.get("status") or {}).get("staged", []) if item.get("path")}
+        manifest, total_bytes = [], 0
+        for path in changed_paths:
+            entry = after_entries.get(path)
+            status_item = status_by_path.get(path, {})
+            if entry is None:
+                manifest.append({"path": path, "kind": "delete", "mode": None,
+                                 "oid": None, "index_status": status_item.get("x") or "D"})
+                continue
+            mode, oid, stage = entry
+            size_out, size_rc, _ = sim_repo._run("cat-file", "-s", oid)
+            if size_rc or not re.fullmatch(r"[0-9]+", size_out.strip()):
+                raise RuntimeError("Candidate object size is missing or malformed; no complete manifest is available.")
+            size = int(size_out.strip())
+            total_bytes += size
+            manifest.append({"path": path, "kind": "gitlink" if mode == "160000" else "blob",
+                             "mode": mode, "oid": oid, "stage": stage, "size": size,
+                             "index_status": status_item.get("x")})
+
+        # Detect observed changes within this preview; this is not a future-writer lock.
+        if (_index_fingerprint(real_repo) != before_fingerprint or _head_oid(real_repo) != before_head
+                or _index_fingerprint(sim_repo) != after_fingerprint):
+            raise RuntimeError("The real or candidate index/HEAD changed during staging preview; refresh.")
+        canonical_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+        commit_action = assess_action(sim_state, "commit_index")
+        action_reasons = [] if commit_action.get("safe") is True and commit_action.get("decision") == "ALLOW" else list(
+            commit_action.get("reasons") or ["The simulated commit-index decision is not an explicit ALLOW."])
+        if not manifest:
+            action_reasons.append("The requested pathspecs produce no index change.")
+        synthetic_roots = (".cache/", ".config/", ".local/", ".npm/", "go/")
+        synthetic = [item["path"] for item in manifest if item["path"] in {p[:-1] for p in synthetic_roots}
+                     or item["path"].startswith(synthetic_roots)]
+        if synthetic:
+            action_reasons.append(f"{len(synthetic)} candidate path(s) are synthetic HOME/cache state and must not enter Git.")
+        gitlinks = [item["path"] for item in manifest if item["kind"] == "gitlink"]
+        if gitlinks:
+            action_reasons.append(f"{len(gitlinks)} candidate gitlink(s) cross repository ownership; stage in their own repositories.")
+        action_reasons = list(dict.fromkeys(action_reasons))
+        action = {**base_action, "safe": not action_reasons,
+                  "decision": "ALLOW" if not action_reasons else "BLOCK",
+                  "reasons": action_reasons or ["The isolated candidate index passes GIT_REAL's commit-index preservation checks."],
+                  "head_oid": before_head, "index_fingerprint": before_fingerprint,
+                  "candidate_index_fingerprint": after_fingerprint, "manifest": manifest,
+                  "manifest_digest": "sha256:" + hashlib.sha256(canonical_manifest).hexdigest(),
+                  "candidate_count": len(manifest), "candidate_bytes": total_bytes,
+                  "simulated_commit_action": commit_action, "simulation_object_directory": "isolated-temporary"}
+        return _stage_result(sim_state, action)
 
 
 def stash_committed_copy(state: dict, target: str | None) -> dict:
@@ -1155,8 +2407,21 @@ def closeout_state(state: dict) -> dict:
         remaining.append("status_hidden_paths")
     if state.get("active_operations") or state.get("index_locked"):
         remaining.append("git_operation_in_progress")
+    storage = state.get("object_storage") or {}
+    storage_complete = (
+        storage.get("complete") is True
+        and isinstance(storage.get("errors"), list) and not storage["errors"]
+        and type(storage.get("loose_count")) is int and storage["loose_count"] >= 0
+        and type(storage.get("loose_bytes")) is int and storage["loose_bytes"] >= 0
+        and type(storage.get("maintenance_required")) is bool
+    )
+    if storage_complete and storage["maintenance_required"]:
+        remaining.append("object_storage_maintenance")
     complete = (state.get("read_complete") is True and state.get("is_repo") is True
-                and state.get("topology", {}).get("kind") == "own_repo")
+                and state.get("topology", {}).get("kind") == "own_repo"
+                and storage_complete)
+    if not storage_complete:
+        remaining.append("object_storage_incomplete")
     return {**counts, "status": ("BLOCKED" if not complete else
                                  "RECONCILE" if remaining else "LOCAL_STATE_COMPLETE"),
             "local_state_complete": complete and not remaining,
@@ -1167,6 +2432,31 @@ def closeout_state(state: dict) -> dict:
 # ----------------------------------------------------------------------------
 # state builder
 # ----------------------------------------------------------------------------
+def _incomplete_state(state: dict, repo: GitRepo, config: dict, started: float) -> dict:
+    """Publish an explicit refusal without continuing repository inspection."""
+    state["read_complete"] = False
+    state["read_errors"] = list(dict.fromkeys(state.get("read_errors", []) + repo.read_errors))
+    state["status"].update(ok=False, complete=False, oid=None, submodules=[],
+                           ahead_behind_known=False, error="; ".join(state["read_errors"]))
+    state.update(index_inventory={"fingerprint": None, "hidden_paths": [], "gitlinks": [],
+                                  "unmerged_paths": []},
+                 worktrees=[], extra_worktree_count=None, stale_worktree_count=None,
+                 active_operations=[], index_locked=None, untracked_inventory=[],
+                 ignored_count=None, unpushed_commit_count=None, branch_ahead_commit_count=None,
+                 unpushed_count_scope="Uninspected local refs", main_equals_origin_main=None,
+                 main_oid=None, origin_main_oid=None, refs_fingerprint=None,
+                 consistency="Inspection stopped at admission; inventories are unknown.")
+    state["scores"] = state.get("scores") or compute_scores(state)
+    state["actions"] = {name: assess_action(state, name) for name in (
+        "commit_index", "discard_tracked", "clean_untracked", "clean_ignored",
+        "maintain_objects", *REF_ACTIONS)}
+    if config.get("operation"):
+        requested_action(state, config["operation"], config.get("target"), config.get("expected_binding"))
+    state["closeout"] = closeout_state(state)
+    state["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    return state
+
+
 def build_state(repo: GitRepo, config: dict) -> dict:
     started = time.perf_counter()
     repo.read_errors = []
@@ -1190,7 +2480,7 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         "generated_at_human": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "root": root,
         "root_name": os.path.basename(root.rstrip("/")) or root,
-        "is_repo": repo.is_repo(),
+        "is_repo": None,
         "has_commits": False,
         "status": {"branch": None, "upstream": None, "ahead": 0, "behind": 0,
                    "detached": False, "staged": [], "modified": [], "untracked": [],
@@ -1210,10 +2500,16 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         },
         "read_complete": True,
         "read_errors": [],
+        "object_storage": {"complete": False, "errors": ["Object storage not inspected"],
+                           "loose_count": None, "loose_bytes": None,
+                           "maintenance_required": None},
         "remotes_detail": [],
         "push_weight": {},
     }
 
+    if repo.read_errors:
+        return _incomplete_state(state, repo, config, started)
+    state["is_repo"] = repo.is_repo()
     if not state["is_repo"]:
         state["read_complete"] = False
         state["read_errors"] = ["Not a readable Git working tree"]
@@ -1230,7 +2526,54 @@ def build_state(repo: GitRepo, config: dict) -> dict:
             "safe_delete_label": "NOT A GIT REPO",
             "safe_delete_reasons": ["No git repository to track yet."],
         }
-        return state
+        return _incomplete_state(state, repo, config, started)
+
+    # Hooks legitimately export the default index/repository paths. Accept those
+    # exact paths, but do not silently inspect a different index or repository.
+    gitdir = os.path.join(root, ".git")
+    if os.path.isfile(gitdir):
+        try:
+            with open(gitdir, encoding="utf-8") as fh:
+                link = fh.readline().rstrip("\n")
+            if not link.startswith("gitdir: "):
+                raise ValueError("not a gitfile")
+            gitdir = os.path.abspath(os.path.join(root, link[8:]))
+        except (OSError, ValueError):
+            repo.read_errors.append("Linked worktree gitdir could not be resolved")
+    expected = {"GIT_DIR": gitdir, "GIT_WORK_TREE": root,
+                "GIT_INDEX_FILE": os.path.join(gitdir, "index")}
+    allowed_environment = config.get("_allowed_git_environment") or {}
+    git_environment = getattr(repo, "git_environment", None)
+    git_environment = os.environ if git_environment is None else git_environment
+    redirected = []
+    for key, destination in expected.items():
+        value = git_environment.get(key)
+        if not value:
+            continue
+        allowed = allowed_environment.get(key)
+        if allowed and _environment_matches(key, value, allowed):
+            continue
+        actual = value if os.path.isabs(value) else os.path.join(root, value)
+        if os.path.normcase(os.path.realpath(actual)) != os.path.normcase(os.path.realpath(destination)):
+            redirected.append(key)
+    for key in ("GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE",
+                "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
+        value = git_environment.get(key)
+        if not value:
+            continue
+        allowed = allowed_environment.get(key)
+        if allowed and _environment_matches(key, value, allowed):
+            continue
+        redirected.append(key)
+    if redirected:
+        repo.read_errors.append("Git environment redirects repository/index scope: " + ", ".join(redirected))
+        return _incomplete_state(state, repo, config, started)
+
+    try:
+        _readonly_index_admission(repo)
+    except (OSError, ValueError, RuntimeError) as exc:
+        repo.read_errors.append(str(exc))
+        return _incomplete_state(state, repo, config, started)
 
     # topology (#3): own repo vs tracked-inside-a-parent (half-extracted standalone)
     top = repo.toplevel()
@@ -1248,36 +2591,26 @@ def build_state(repo: GitRepo, config: dict) -> dict:
         parent["topology"] = state["topology"]
         parent["scores"] = compute_scores(parent)
         parent["actions"] = {name: assess_action(parent, name) for name in parent.get("actions", {})}
+        if config.get("operation") in REF_ACTIONS:
+            requested_action(parent, config["operation"], config.get("target"), config.get("expected_binding"))
         parent["closeout"] = closeout_state(parent)
         return parent
     else:
         state["topology"] = {"kind": "own_repo", "toplevel": top or root}
     if not top:
         repo.read_errors.append("Repository root could not be resolved")
-    # Hooks legitimately export the default index/repository paths. Accept those
-    # exact paths, but do not silently inspect a different index or repository.
-    gitdir = os.path.join(root, ".git")
-    if os.path.isfile(gitdir):
+    status_permitted = True
+    if config.get("operation") in REF_ACTIONS:
         try:
-            with open(gitdir, encoding="utf-8") as fh:
-                link = fh.readline().rstrip("\n")
-            if not link.startswith("gitdir: "):
-                raise ValueError("not a gitfile")
-            gitdir = os.path.abspath(os.path.join(root, link[8:]))
-        except (OSError, ValueError):
-            repo.read_errors.append("Linked worktree gitdir could not be resolved")
-    expected = {"GIT_DIR": gitdir, "GIT_WORK_TREE": root,
-                "GIT_INDEX_FILE": os.path.join(gitdir, "index")}
-    redirected = []
-    for key, destination in expected.items():
-        value = os.environ.get(key)
-        if value and os.path.normcase(os.path.realpath(os.path.join(root, value))) != os.path.normcase(os.path.realpath(destination)):
-            redirected.append(key)
-    redirected.extend(k for k in ("GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE") if os.environ.get(k))
-    if redirected:
-        repo.read_errors.append("Git environment redirects repository/index scope: " + ", ".join(redirected))
-
-    st = repo.status()
+            state["ref_inspection_preflight"] = _ref_inspection_preflight(repo)
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
+            status_permitted = False
+            repo.read_errors.append(str(exc))
+    st = repo.status() if status_permitted else {
+        **state["status"], "oid": None, "ok": False, "complete": False,
+        "submodules": [], "ahead_behind_known": False,
+        "error": "Read-only ref inspection preflight failed; status filters were not invoked.",
+    }
     state["has_commits"] = bool(st.get("oid") and st["oid"] != "(initial)")
     state["status"] = st
     if st.get("ok") is False or st.get("complete") is False:
@@ -1299,6 +2632,11 @@ def build_state(repo: GitRepo, config: dict) -> dict:
     state["stale_worktree_count"] = sum(bool(w.get("prunable")) for w in state["worktrees"])
     state.update(repo.operation_markers())
     refs = repo.refs_inventory()
+    state["refs_fingerprint"] = hashlib.sha256(
+        json.dumps(refs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    state["object_storage"] = repo.object_storage()
+    if state["object_storage"]["complete"] is not True:
+        repo.read_errors.extend(state["object_storage"]["errors"] or ["Object storage inventory incomplete"])
     if bool(refs.get("refs/stash")) != bool(state["stashes"]):
         repo.read_errors.append("Stash ref and reflog inventory disagree; hidden stash work must be preserved.")
     overlays = [name for name in refs if name.startswith("refs/replace/")]
@@ -1458,10 +2796,12 @@ def build_state(repo: GitRepo, config: dict) -> dict:
 
     # Recheck the observed state so an intervening Git edit is not silently mixed
     # into a snapshot. This detects changes during inspection, not future writers.
-    if repo.status() != st:
+    if status_permitted and repo.status() != st:
         repo.read_errors.append("Git status changed during inspection; refresh before acting")
     if repo.refs_inventory() != refs:
         repo.read_errors.append("Git refs changed during inspection; refresh before acting")
+    if repo.object_storage() != state["object_storage"]:
+        repo.read_errors.append("Git object storage or maintenance configuration changed during inspection; refresh before acting")
     if repo.index_inventory()["fingerprint"] != state["index_inventory"]["fingerprint"]:
         repo.read_errors.append("Git index changed during inspection; refresh before acting")
     if repo.ignored_entries() != ignored:
@@ -1475,14 +2815,21 @@ def build_state(repo: GitRepo, config: dict) -> dict:
     markers = repo.operation_markers()
     if any(state[key] != value for key, value in markers.items()):
         repo.read_errors.append("Git operation state changed during inspection; refresh before acting")
-    if repo.status() != st:
+    if status_permitted and repo.status() != st:
         repo.read_errors.append("Working-tree state changed at the final observation; refresh before acting")
     state["consistency"] = "Repeated metadata observations, not an atomic filesystem snapshot or a lock on future writers."
     state["read_errors"] = list(dict.fromkeys(state["read_errors"] + repo.read_errors))
     state["read_complete"] = bool(state["read_complete"] and not state["read_errors"])
     state["scores"] = compute_scores(state)
     state["actions"] = {name: assess_action(state, name) for name in (
-        "commit_index", "discard_tracked", "clean_untracked", "clean_ignored")}
+        "commit_index", "discard_tracked", "clean_untracked", "clean_ignored",
+        "maintain_objects", *REF_ACTIONS)}
+    if config.get("operation") in REF_ACTIONS:
+        try:
+            state["ref_operation_inputs"], _ = _ref_operation_inputs(repo, state)
+        except (OSError, ValueError, RuntimeError, TypeError, KeyError) as exc:
+            state["ref_operation_errors"] = [str(exc)]
+        requested_action(state, config["operation"], config.get("target"), config.get("expected_binding"))
     state["closeout"] = closeout_state(state)
     state["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
     return state
@@ -2017,7 +3364,8 @@ class App:
         if os.path.isfile(p):
             try:
                 with open(p) as fh:
-                    return json.load(fh)
+                    value = json.load(fh)
+                    return value if isinstance(value, dict) else {}
             except Exception:  # noqa: BLE001
                 pass
         return {}
@@ -2051,6 +3399,8 @@ class App:
 # HTTP server
 # ----------------------------------------------------------------------------
 def make_handler(app: App):
+    import urllib.parse
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):  # silence
             pass
@@ -2060,20 +3410,37 @@ def make_handler(app: App):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                self._send(200, render_html(app.get_state(), app.port, app.interval), "text/html; charset=utf-8")
-            elif self.path.startswith("/api/state"):
+            port = self.server.server_port
+            hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if port == 80:
+                hosts.update({"127.0.0.1", "localhost"})
+            host_values = self.headers.get_all("Host", [])
+            origins = self.headers.get_all("Origin", [])
+            if (len(host_values) != 1 or host_values[0].strip().lower() not in hosts
+                    or len(origins) > 1
+                    or (origins and origins[0].strip().lower() not in {"http://" + h for h in hosts})):
+                self._send(403, json.dumps({"error": "local dashboard origin required"}))
+                return
+            try:
+                parsed = urllib.parse.urlsplit(self.path)
+            except ValueError:
+                self._send(400, json.dumps({"error": "invalid request target"}))
+                return
+            if parsed.scheme or parsed.netloc or "#" in self.path:
+                self._send(404, json.dumps({"error": "not found"}))
+            elif parsed.path in ("/", "/index.html"):
+                self._send(200, render_html(app.get_state(), port, app.interval), "text/html; charset=utf-8")
+            elif parsed.path == "/api/state":
                 self._send(200, json.dumps(app.get_state()))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
 
-        # Read-only dashboard (v1): no write endpoints. Mutating the repo (gitignore,
-        # init, mute) is done via the CLI or the GIT_REAL MCP, not an unauthenticated
-        # local HTTP server that any web page could POST to.
+        # Read-only dashboard: no write endpoints or cross-origin permission.
 
     return Handler
 
@@ -2097,37 +3464,74 @@ def start_watchdog(app: App):
     from watchdog.events import FileSystemEventHandler
 
     timer = {"t": None}
+    stopped = threading.Event()
+    timer_lock = threading.Lock()
 
     def debounced():
+        with timer_lock:
+            if stopped.is_set():
+                return
+        # A rescan already admitted here may finish after stop; cancellation
+        # cannot roll back an in-flight observation or publication.
         app.rescan()
 
     class H(FileSystemEventHandler):
         def on_any_event(self, event):
             if _should_ignore_event(getattr(event, "src_path", "")):
                 return
-            if timer["t"]:
-                timer["t"].cancel()
-            timer["t"] = threading.Timer(DEBOUNCE_SECONDS, debounced)
-            timer["t"].daemon = True
-            timer["t"].start()
+            with timer_lock:
+                if stopped.is_set():
+                    return
+                if timer["t"]:
+                    timer["t"].cancel()
+                timer["t"] = threading.Timer(DEBOUNCE_SECONDS, debounced)
+                timer["t"].daemon = True
+                timer["t"].start()
 
     obs = Observer()
-    obs.schedule(H(), app.root, recursive=True)
-    obs.daemon = True
-    obs.start()
+    observer_stop, observer_join = obs.stop, obs.join
+
+    def stop():
+        with timer_lock:
+            stopped.set()
+            if timer["t"]:
+                timer["t"].cancel()
+        observer_stop()
+
+    def join(timeout=None):
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        observer_join(timeout=timeout)
+        with timer_lock:
+            pending = timer["t"]
+        if pending is not None:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            try:
+                pending.join(timeout=remaining)
+            except RuntimeError:
+                pass  # A timer whose start failed has no running thread to join.
+
+    obs.stop, obs.join = stop, join
+    try:
+        obs.schedule(H(), app.root, recursive=True)
+        obs.daemon = True
+        obs.start()
+    except BaseException:
+        obs.stop()
+        try:
+            obs.join(timeout=2)
+        except RuntimeError:
+            pass  # The observer itself may not have started.
+        raise
     return obs
 
 
 def start_polling(app: App, stop_event: threading.Event):
     def loop():
-        last_sig = None
         while not stop_event.is_set():
             try:
-                out, _, _ = app.repo._run("status", "--porcelain")
-                sig = hashlib.md5(out.encode()).hexdigest()
-                if sig != last_sig:
-                    app.rescan()
-                    last_sig = sig
+                # The full builder owns filter/storage admission. A raw status
+                # shortcut could execute a filter before that boundary is checked.
+                app.rescan()
             except Exception:  # noqa: BLE001
                 pass
             stop_event.wait(app.interval)
@@ -2142,35 +3546,42 @@ def start_polling(app: App, stop_event: threading.Event):
 SKIP_WALK_DIRS = JUNK_DIR_NAMES | {".git", OUTPUT_DIRNAME, ".hg", ".svn", ".idea"}
 
 
-def load_registry_repo_paths(repos_file: str) -> list[str]:
-    """Load discovery-enabled Git paths from a committed fleet projection or a repos list.
+def load_registry_repo_paths(repos_file: str, *, relative_root: str | None = None) -> list[str]:
+    """Load explicit fleet authority; malformed entries never widen discovery."""
+    fd = os.open(repos_file, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("repos file must be a regular JSON file")
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            fd = None
+            data = json.load(fh)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    paths, seen = [], set()
 
-    Accepts either:
-      {"repositories": [{"physical_location": "...", "discovery_enabled": true}, ...]}
-      {"repos": ["...", "..."]}
-    The committed projection is the canonical workshop input. Ignored
-    `.git-real/fleet.json` is not authority.
-    """
-    with open(repos_file, encoding="utf-8") as fh:
-        data = json.load(fh)
-    paths: list[str] = []
-    seen: set[str] = set()
+    def add(raw):
+        if not isinstance(raw, str) or not raw or "\0" in raw:
+            raise ValueError("repository paths must be nonempty strings without NUL")
+        expanded = os.path.expanduser(raw)
+        if relative_root is not None and not os.path.isabs(expanded):
+            expanded = os.path.join(relative_root, expanded)
+        path = os.path.abspath(expanded)
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
 
-    def add(raw: str) -> None:
-        p = os.path.abspath(os.path.expanduser(str(raw)))
-        if p not in seen:
-            seen.add(p)
-            paths.append(p)
-
-    if isinstance(data, dict) and isinstance(data.get("repositories"), list):
+    if isinstance(data, dict) and "repositories" in data:
+        if not isinstance(data["repositories"], list):
+            raise ValueError("repositories must be a list")
         for row in data["repositories"]:
             if not isinstance(row, dict):
-                continue
-            if row.get("discovery_enabled") is False:
-                continue
-            loc = row.get("physical_location")
-            if loc:
-                add(loc)
+                raise ValueError("repository entries must be objects")
+            enabled = row.get("discovery_enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValueError("discovery_enabled must be boolean")
+            if enabled:
+                add(row.get("physical_location"))
         return paths
     if isinstance(data, dict) and isinstance(data.get("repos"), list):
         for raw in data["repos"]:
@@ -2188,7 +3599,10 @@ def discover_all_git(root: str, max_depth: int = 4) -> list[str]:
     root = os.path.abspath(root)
     found, seen = [], set()
     base = root.rstrip("/").count("/")
-    for dirpath, dirnames, filenames in os.walk(root):
+    def walk_error(error):
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=walk_error):
         depth = dirpath.rstrip("/").count("/") - base
         if depth > max_depth:
             dirnames[:] = []
@@ -2253,7 +3667,7 @@ def discover_repos(root: str, max_depth: int = 4, pinned=None) -> list[str]:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     fleet_ignored.add(os.path.abspath(os.path.join(root, line)))
-    except OSError:
+    except FileNotFoundError:
         pass
 
     def add(path):
@@ -2264,12 +3678,16 @@ def discover_repos(root: str, max_depth: int = 4, pinned=None) -> list[str]:
 
     if pinned:
         for p in pinned:
+            p = os.path.expanduser(p)
             pp = p if os.path.isabs(p) else os.path.join(root, p)
             if os.path.isdir(pp) and os.path.exists(os.path.join(pp, ".git")):
                 add(pp)
 
     base = root.rstrip("/").count("/")
-    for dirpath, dirnames, filenames in os.walk(root):
+    def walk_error(error):
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=walk_error):
         if os.path.abspath(dirpath) in fleet_ignored:
             dirnames[:] = []
             continue
@@ -2294,8 +3712,12 @@ def repo_summary(path: str, config: dict) -> dict:
     repo = GitRepo(path)
     state = build_state(repo, config)
     sc, st = state.get("scores", {}), state.get("status", {})
-    read_complete = state.get("read_complete", True)
+    read_complete = state.get("read_complete") is True
     read_errors = [e for e in (state.get("read_errors") or []) if e]
+    if read_errors:
+        read_complete = False
+    if not read_complete and not read_errors:
+        read_errors = ["Repository inventory incomplete"]
     return {
         "name": state.get("root_name"), "path": path, "is_repo": state.get("is_repo"),
         "branch": "(detached)" if st.get("detached") else st.get("branch"),
@@ -2308,7 +3730,8 @@ def repo_summary(path: str, config: dict) -> dict:
         "dirty_files": None if not read_complete else len(state.get("files", [])),
         "side_branches": len(state.get("side_branches", [])) if read_complete else None,
         "unpushed": state.get("unpushed_commit_count") if read_complete else None,
-        "ahead": st.get("ahead", 0), "behind": st.get("behind", 0),
+        "ahead": st.get("ahead") if read_complete else None,
+        "behind": st.get("behind") if read_complete else None,
         "stashes": len(state.get("stashes", [])) if read_complete else None,
         "stash_summary": state.get("stash_summary", {}),
         "topology": state.get("topology", {}).get("kind"),
@@ -2321,12 +3744,16 @@ def repo_summary(path: str, config: dict) -> dict:
         "last_commit": state.get("last_commit"),
         "worktrees": len(state.get("worktrees", [])) if read_complete else None,
         "extra_worktree_count": state.get("extra_worktree_count") if read_complete else None,
-        "hidden_path_count": len(state.get("index_inventory", {}).get("hidden_paths", [])),
+        "hidden_path_count": len(state.get("index_inventory", {}).get("hidden_paths", [])) if read_complete else None,
         "schema_version": state.get("schema_version"),
         "generated_at": state.get("generated_at"),
         "actions": state.get("actions", {}), "closeout": state.get("closeout", {}),
+        "object_storage": state.get("object_storage", {}),
         "main_equals_origin_main": state.get("main_equals_origin_main"),
-        "hooks": _hook_verdict(path),
+        "hooks": _hook_verdict(path) if read_complete else {
+            "read_complete": False, "read_errors": ["Repository inspection refused; hooks not inspected"],
+            "core_hooks_path": None, "hooks_dir": None, "pre_commit": None, "pre_push": None,
+        },
     }
 
 
@@ -2338,16 +3765,25 @@ def _worktree_count(repo: GitRepo) -> int | None:
 
 
 def _hook_verdict(path: str) -> dict:
+    """Report hook-file presence; never execute hooks or hide metadata failures."""
     repo = GitRepo(path)
-    hooks_path_out, rc, _ = repo._run("config", "--get", "core.hooksPath")
+    hooks_path_out, rc, err = repo._run("config", "--get", "core.hooksPath")
+    unknown = {"read_complete": False, "read_errors": [], "core_hooks_path": None,
+               "hooks_dir": None, "pre_commit": None, "pre_push": None}
+    if rc not in (0, 1):
+        unknown["read_errors"] = ["Hook configuration unavailable: " + err]
+        return unknown
     hooks_path = hooks_path_out.strip() if rc == 0 else ""
-    resolved, rrc, _ = repo._run("rev-parse", "--git-path", "hooks")
-    resolved = resolved.strip() if rrc == 0 else os.path.join(path, ".git/hooks")
+    resolved, rrc, err = repo._run("rev-parse", "--git-path", "hooks")
+    if rrc != 0 or not resolved.strip():
+        unknown["read_errors"] = ["Hook directory unavailable: " + err]
+        return unknown
+    resolved = resolved.strip()
     if not os.path.isabs(resolved):
         resolved = os.path.join(path, resolved)
     return {
-        "core_hooks_path": hooks_path or None,
-        "hooks_dir": resolved,
+        "read_complete": True, "read_errors": [],
+        "core_hooks_path": hooks_path or None, "hooks_dir": resolved,
         "pre_commit": os.path.isfile(os.path.join(resolved, "pre-commit"))
         and os.access(os.path.join(resolved, "pre-commit"), os.X_OK),
         "pre_push": os.path.isfile(os.path.join(resolved, "pre-push"))
@@ -2359,7 +3795,7 @@ def _repo_is_verified_clean(r: dict) -> bool:
     """Failed or incomplete Git reads are not clean repositories."""
     if r.get("error") or r.get("hidden_path_count"):
         return False
-    if r.get("read_complete") is False:
+    if r.get("read_complete") is not True:
         return False
     if r.get("is_repo") is not True:
         return False
@@ -2367,6 +3803,18 @@ def _repo_is_verified_clean(r: dict) -> bool:
     if dirty is None:
         return False
     return dirty == 0
+
+
+def _fleet_failure_state(root: str, reason: str) -> dict:
+    """Expose failed fleet observation instead of keeping an apparently fresh scan."""
+    now = datetime.now(timezone.utc).astimezone()
+    return {"version": VERSION, "schema_version": SCHEMA_VERSION, "mode": "fleet",
+            "root": os.path.abspath(root), "read_complete": False, "read_errors": [reason],
+            "generated_at": now.isoformat(timespec="seconds"),
+            "generated_at_human": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "inventory_scope": "Fleet inventory failed; previous selected repositories are not certified.",
+            "totals": {"repos": 0, "unknown_repos": 0, "clean_repos": 0,
+                       "total_unpushed": None, "unpushed_total_complete": False}, "repos": []}
 
 
 def build_fleet_state(
@@ -2377,6 +3825,9 @@ def build_fleet_state(
     registry_paths: list[str] | None = None,
 ) -> dict:
     import concurrent.futures
+    if not os.path.isdir(root):
+        return _fleet_failure_state(root, "Fleet root is not a readable directory")
+    repo_paths = list(dict.fromkeys(os.path.abspath(p) for p in repo_paths))
     repos = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         futs = {ex.submit(repo_summary, p, config): p for p in repo_paths}
@@ -2438,6 +3889,8 @@ def build_fleet_state(
         "unknown_repos": sum(1 for r in own if r.get("read_complete") is not True),
         "unknown_unpushed_repos": sum(1 for r in own if r.get("unpushed") is None),
         "local_closeout_complete_repos": sum(1 for r in own if r.get("closeout", {}).get("local_state_complete") is True),
+        "object_maintenance_repos": sum(1 for r in own if (r.get("object_storage") or {}).get("maintenance_required") is True),
+        "object_storage_unknown_repos": sum(1 for r in own if (r.get("object_storage") or {}).get("complete") is not True),
         "external_repos": sum(1 for r in repos if r.get("external")),
         # All explicitly selected repositories contribute to the alarm counts.
         "dirty_repos": sum(1 for r in own if r.get("dirty_files")),
@@ -2457,9 +3910,9 @@ def build_fleet_state(
     return {
         "version": VERSION, "mode": "fleet",
         "schema_version": SCHEMA_VERSION,
-        "read_complete": bool(repos) and os.path.isdir(root) and all(r.get("read_complete") is True for r in repos),
+        "read_complete": bool(repos) and os.path.isdir(root) and all(r.get("read_complete") is True and not r.get("error") for r in repos),
         "read_errors": (["No readable repositories selected"] if not repos else
-                        [r.get("error") or "Repository inventory incomplete" for r in repos if r.get("read_complete") is not True]),
+                        [r.get("error") or "Repository inventory incomplete" for r in repos if r.get("read_complete") is not True or r.get("error")]),
         "inventory_scope": "Selected repositories only; bounded discovery or an explicit registry, not every excluded directory.",
         "generated_at": now.isoformat(timespec="seconds"),
         "generated_at_human": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -2610,21 +4063,22 @@ button.warn{background:var(--infer)!important;color:#0a0c05!important;box-shadow
   <div class="totals" id="totals"></div>
   <div class="grid" id="grid"></div>
   <div class="foot">
-    <span class="live"><span class="pulse"></span> live · updated <span id="updated"></span></span>
+    <span class="live"><span id="health">saved snapshot</span> · updated <span id="updated"></span></span>
     <span id="rootp"></span>
   </div>
 </div>
 <div class="modal" id="modal"><div class="sheet clip" id="sheet"></div></div>
 <script>
-const EMBEDDED=__STATE_JSON__;const PORT=__PORT__;let STATE=EMBEDDED;
+const EMBEDDED=__STATE_JSON__;const PORT=__PORT__;let STATE=EMBEDDED;let LIVE=false;
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function bc(b){return b==='GO'?'go':b==='CAUTION'?'caution':'stop';}
 function tcard(n,l,cls){return `<div class="tcard ${cls||''}"><div class="n">${n}</div><div class="l">${l}</div></div>`;}
 function render(){
  const s=STATE,t=s.totals||{};
+ document.getElementById('health').textContent=(LIVE?'live':'saved snapshot · live refresh unavailable')+(s.read_complete===true?' · selected inventory complete':' · incomplete: '+((s.read_errors||[]).join('; ')||'inventory unknown'));
  document.getElementById('totals').innerHTML=
    tcard(t.repos||0,'repos')+
-   tcard(t.dirty_repos||0,'dirty repos',(t.dirty_repos||t.unknown_repos?'':'good'))+
+   tcard(t.dirty_repos||0,'dirty repos',(t.dirty_repos||t.unknown_repos||s.read_complete!==true?'':'good'))+
    tcard(t.total_dirty_files||0,'dirty files')+
    tcard(t.total_side_branches||0,'side branches')+
    tcard(t.total_unpushed==null?'?':t.total_unpushed,'unpushed')+
@@ -2636,7 +4090,7 @@ function render(){
  const g=document.getElementById('grid');const repos=s.repos||[];
  if(!repos.length){g.innerHTML='<div class="empty">No git repos found under this root.</div>';}
  else g.innerHTML=repos.map((r,i)=>{
-   if(r.error)return `<div class="repo clip"><div class="rtop"><span class="rname">${esc(r.name)}</span></div><div class="chip">error: ${esc(r.error)}</div></div>`;
+   if(r.error||r.read_complete!==true)return `<div class="repo clip"><div class="rtop"><span class="rname">${esc(r.name)}</span></div><div class="chip">error: ${esc(r.error||'Repository inventory incomplete')}</div></div>`;
    const cls=(r.dirty_files||r.hidden_path_count)?'dirty':'clean';
    let chips='';
    if(r.dirty_files)chips+=`<span class="chip dirty">${r.dirty_files} dirty</span>`;
@@ -2644,8 +4098,8 @@ function render(){
    if(r.unpushed)chips+=`<span class="chip push">${r.unpushed} unpushed</span>`;
    if(r.unpushed==null)chips+='<span class="chip push">publication unknown</span>';
    if(r.hidden_path_count)chips+=`<span class="chip dirty">${r.hidden_path_count} hidden-index paths</span>`;
-   if(r.stash_count){const un=(r.stash_summary||{}).unmerged||0;
-     chips+=`<span class="chip${un?' secret':' branch'}" title="${un} hold unmerged work">${r.stash_count} stash${un?' &middot; '+un+' unmerged':''}</span>`;}
+   if(r.stashes){const un=(r.stash_summary||{}).unmerged||0;
+     chips+=`<span class="chip${un?' secret':' branch'}" title="${un} hold unmerged work">${r.stashes} stash${un?' &middot; '+un+' unmerged':''}</span>`;}
    if(r.embedded)chips+=`<span class="chip branch" title="tracked inside a parent repo - not its own repo">embedded</span>`;
    if((r.push_weight||{}).heavy)chips+=`<span class="chip push" title="heavy pack - slow push/clone">heavy ${esc((r.push_weight||{}).pack_human||'')}</span>`;
    if(r.ahead||r.behind)chips+=`<span class="chip">&#8593;${r.ahead} &#8595;${r.behind}</span>`;
@@ -2660,10 +4114,10 @@ function render(){
      <div class="chips">${chips}</div></div>`;
  }).join('');
  document.getElementById('updated').textContent=s.generated_at_human||'';
- document.getElementById('rootp').textContent=esc(s.root||'');
+ document.getElementById('rootp').textContent=s.root||'';
  document.title=`GIT_REAL FLEET · ${t.repos||0} repos`;
 }
-async function refresh(){try{const r=await fetch(`http://127.0.0.1:${PORT}/api/fleet`,{cache:'no-store'});if(r.ok){STATE=await r.json();render();}}catch(e){}}
+async function refresh(){try{const r=await fetch(`http://127.0.0.1:${PORT}/api/fleet`,{cache:'no-store'});if(!r.ok)throw Error('refresh failed');const next=await r.json();if(!next||next.schema_version!==2||!Array.isArray(next.repos)||typeof next.read_complete!=='boolean')throw Error('invalid fleet response');STATE=next;LIVE=true;}catch(e){LIVE=false;}render();}
 async function openRepo(i){
  const r=(STATE.repos||[])[i];if(!r)return;
  const sheet=document.getElementById('sheet');
@@ -2672,6 +4126,7 @@ async function openRepo(i){
  let st=null;
  try{const resp=await fetch(`http://127.0.0.1:${PORT}/api/repo?path=`+encodeURIComponent(r.path));if(resp.ok)st=await resp.json();}catch(e){}
  if(!st){sheet.querySelector('.empty').textContent='Detail needs the live server (open via the URL, not the file).';return;}
+ if(st.read_complete!==true||(st.read_errors||[]).length){sheet.innerHTML=`<span class="closex" onclick="closeModal()">&times;</span><h2>${esc(st.root_name||r.name)}</h2><div class="mpath">${esc(st.root||r.path)}</div><div class="empty">Inspection incomplete: ${esc((st.read_errors||[]).join('; ')||st.error||'inventory unknown')}</div>`;return;}
  const sc=st.scores||{};
  const reasons=(arr)=>`<ul class="reasons">${(arr||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>-</li>'}</ul>`;
  const fl=(st.files||[]).map(f=>{const cm={staged:'b-staged',modified:'b-dirty',new:'b-new',junk:'b-junk',conflict:'b-conflict'}[f.category]||'b-dirty';
@@ -2691,67 +4146,76 @@ render();setInterval(refresh,Math.max(2000,__INTERVAL__*1000));refresh();
 
 
 def render_fleet_html(state: dict, port: int, interval: float) -> str:
-    page = FLEET_HTML
-    page = page.replace("__STATE_JSON__", json_for_script(state))
-    page = page.replace("__PORT__", str(port))
-    page = page.replace("__INTERVAL__", str(interval))
-    page = page.replace("__VERSION__", html_text(VERSION))
-    page = page.replace("__REPO_COUNT__", html_text(state.get("totals", {}).get("repos", 0)))
-    return page
+    # Substitute the template once so placeholder-looking repository text is data.
+    values = {"__STATE_JSON__": json_for_script(state), "__PORT__": str(port),
+              "__INTERVAL__": str(interval), "__VERSION__": html_text(VERSION),
+              "__REPO_COUNT__": html_text(state.get("totals", {}).get("repos", 0))}
+    return re.sub(r"__STATE_JSON__|__PORT__|__INTERVAL__|__VERSION__|__REPO_COUNT__",
+                  lambda match: values[match.group(0)], FLEET_HTML)
 
 
 class FleetApp:
     def __init__(self, root: str, port: int, interval: float, pinned=None, registry_paths=None):
         self.root = os.path.abspath(root)
         self.port, self.interval = port, interval
-        self.pinned = pinned or []
+        self.pinned = list(pinned or [])
+        self.registry_authority = registry_paths is not None
         self.registry_paths = list(registry_paths or [])
         self.outdir = os.path.join(self.root, OUTPUT_DIRNAME)
         if os.path.islink(self.outdir):
             raise OSError("Refusing a symlinked GIT_REAL output directory")
         os.makedirs(self.outdir, exist_ok=True)
         gi = os.path.join(self.outdir, ".gitignore")
-        if not os.path.exists(gi):
+        if not os.path.lexists(gi):
             try:
-                open(gi, "w").write("*\n")
-            except Exception:  # noqa: BLE001
+                with open(gi, "x", encoding="utf-8") as fh:
+                    fh.write("*\n")
+            except FileExistsError:
                 pass
         self.config = {}
         self.state, self.lock = {}, threading.Lock()
+        self.scan_lock = threading.Lock()
         self.drift = {}
         self.repo_paths = self._discover()
 
     def _discover(self) -> list[str]:
-        if self.registry_paths:
+        if self.registry_authority:
             self.drift = registry_fleet_paths(self.root, self.registry_paths)
             return list(self.drift.get("present") or [])
         return discover_repos(self.root, pinned=self.pinned)
 
     def rescan(self):
-        with self.lock:
-            self.repo_paths = self._discover()
-            self.state = build_fleet_state(
-                self.root,
-                self.repo_paths,
-                self.config,
-                registry_paths=self.registry_paths,
-            )
-            if self.registry_paths:
-                self.state["registry_authority"] = True
-                self.state["drift_unregistered"] = list(self.drift.get("drift_unregistered") or [])
-                self.state["drift_missing"] = list(self.drift.get("drift_missing") or [])
-                self.state.setdefault("totals", {})
-                self.state["totals"]["drift_unregistered"] = len(self.state["drift_unregistered"])
-                self.state["totals"]["drift_missing"] = len(self.state["drift_missing"])
-                if self.state["drift_missing"]:
-                    self.state["read_complete"] = False
-                    self.state["read_errors"].append("Registered repositories are missing")
-            atomic_write_text(os.path.join(self.outdir, "git-real-fleet.json"),
-                              json.dumps(self.state, indent=2) + "\n")
-            if not self.config.get("quick"):
-                atomic_write_text(os.path.join(self.outdir, "git-real-fleet.html"),
-                                  render_fleet_html(self.state, self.port, self.interval))
-            return self.state
+        with self.scan_lock:
+            try:
+                paths = self._discover()
+                state = build_fleet_state(
+                    self.root, paths, self.config, registry_paths=self.registry_paths,
+                )
+                if self.registry_authority:
+                    state["registry_authority"] = True
+                    state["drift_unregistered"] = list(self.drift.get("drift_unregistered") or [])
+                    state["drift_missing"] = list(self.drift.get("drift_missing") or [])
+                    state["totals"]["drift_unregistered"] = len(state["drift_unregistered"])
+                    state["totals"]["drift_missing"] = len(state["drift_missing"])
+                    if state["drift_missing"]:
+                        state["read_complete"] = False
+                        state["read_errors"].append("Registered repositories are missing")
+            except Exception as exc:  # noqa: BLE001
+                paths = []
+                state = _fleet_failure_state(self.root, f"Fleet refresh failed: {exc}")
+                state["registry_authority"] = self.registry_authority
+            try:
+                atomic_write_text(os.path.join(self.outdir, "git-real-fleet.json"),
+                                  json.dumps(state, indent=2) + "\n")
+                if not self.config.get("quick"):
+                    atomic_write_text(os.path.join(self.outdir, "git-real-fleet.html"),
+                                      render_fleet_html(state, self.port, self.interval))
+            except OSError as exc:
+                state["read_complete"] = False
+                state["read_errors"].append(f"Fleet snapshot publication failed: {exc}")
+            with self.lock:
+                self.repo_paths, self.state = paths, state
+            return state
 
     def get_state(self):
         with self.lock:
@@ -2759,7 +4223,9 @@ class FleetApp:
 
     def repo_state(self, path: str):
         path = os.path.abspath(path)
-        if path not in {os.path.abspath(p) for p in self.repo_paths}:
+        with self.lock:
+            selected = {os.path.abspath(p) for p in self.repo_paths}
+        if path not in selected:
             return {"error": "unknown repo"}
         return build_state(GitRepo(path), self.config)
 
@@ -2776,55 +4242,70 @@ def make_fleet_handler(app: "FleetApp"):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                self._send(200, render_fleet_html(app.get_state(), app.port, app.interval), "text/html; charset=utf-8")
-            elif self.path.startswith("/api/fleet"):
+            port = self.server.server_port
+            hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            if port == 80:
+                hosts.update({"127.0.0.1", "localhost"})
+            host = self.headers.get("Host", "").lower()
+            origin = self.headers.get("Origin")
+            if host not in hosts or (origin is not None and origin.lower() not in {"http://" + h for h in hosts}):
+                self._send(403, json.dumps({"error": "local dashboard origin required"}))
+                return
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.scheme or parsed.netloc:
+                self._send(404, json.dumps({"error": "not found"}))
+            elif parsed.path in ("/", "/index.html"):
+                self._send(200, render_fleet_html(app.get_state(), port, app.interval), "text/html; charset=utf-8")
+            elif parsed.path == "/api/fleet":
                 self._send(200, json.dumps(app.get_state()))
-            elif self.path.startswith("/api/repo"):
-                q = urllib.parse.urlparse(self.path).query
-                path = urllib.parse.parse_qs(q).get("path", [""])[0]
+            elif parsed.path == "/api/repo":
+                path = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
                 self._send(200, json.dumps(app.repo_state(path)))
             else:
                 self._send(404, json.dumps({"error": "not found"}))
 
-        # Read-only dashboard (v1): no write endpoints (see make_handler).
+        # Read-only dashboard: no write endpoints.
 
     return H
 
 
 def run_fleet(args, root: str):
     pinned = []
-    registry_paths = []
+    registry_paths = None
     repos_file = getattr(args, "repos_file", None)
     if not repos_file:
         default_projection = os.path.join(root, "governance", "generated", "REPOSITORY_FLEET.json")
-        if os.path.isfile(default_projection):
+        if os.path.lexists(default_projection):
             repos_file = default_projection
-    if repos_file:
-        registry_paths = load_registry_repo_paths(repos_file)
-    else:
-        pin_file = os.path.join(root, OUTPUT_DIRNAME, "fleet.json")
-        if os.path.isfile(pin_file):
-            try:
-                pinned = json.load(open(pin_file)).get("repos", [])
-            except Exception:  # noqa: BLE001
-                pass
-    app = FleetApp(root, args.port, args.interval, pinned=pinned, registry_paths=registry_paths)
-    app.config.update(quick=getattr(args, "quick", False))
-    app.rescan()
+    try:
+        if repos_file:
+            registry_paths = load_registry_repo_paths(repos_file)
+        else:
+            pin_file = os.path.join(root, OUTPUT_DIRNAME, "fleet.json")
+            if os.path.lexists(pin_file):
+                pinned = load_registry_repo_paths(pin_file, relative_root=root)
+        app = FleetApp(root, args.port, args.interval, pinned=pinned, registry_paths=registry_paths)
+        app.config.update(quick=getattr(args, "quick", False))
+        app.rescan()
+    except (OSError, ValueError) as exc:
+        print(f"[gitreal] fleet input/refresh failed: {exc}", file=sys.stderr)
+        sys.exit(2)
     t = app.state.get("totals", {})
 
     if args.once:
-        print(f"[gitreal] FLEET JSON snapshot -> {app.outdir}/git-real-fleet.json")
+        print(f"[gitreal] FLEET snapshot result: {app.outdir}/git-real-fleet.json")
         print(f"           {t.get('repos',0)} repos | {t.get('dirty_repos',0)} dirty | {t.get('total_side_branches',0)} side-branches")
-        if app.registry_paths:
+        if app.registry_authority:
             print(f"           registry authority | drift_unregistered={t.get('drift_unregistered',0)} "
                   f"| drift_missing={t.get('drift_missing',0)}")
-        rc = 2 if t.get("unknown_repos") or not app.state.get("repos") or t.get("drift_missing") else 0
+        rc = 0 if app.state.get("read_complete") is True else 2
+        if app.state.get("read_errors"):
+            print("           incomplete: " + "; ".join(app.state["read_errors"]))
         if args.fail_under is not None:
             low = [r for r in app.state["repos"] if (r.get("safe_commit") or 0) < args.fail_under]
             if low:
@@ -2836,25 +4317,25 @@ def run_fleet(args, root: str):
     print(f"  root     : {root}")
     print(f"  repos    : {t.get('repos',0)} discovered")
     print(f"  outputs  : {app.outdir}/git-real-fleet.html  +  git-real-fleet.json")
-
     stop_event = threading.Event()
+    worker = None
+    httpd = None
 
     def loop():
         while not stop_event.is_set():
             stop_event.wait(max(3, args.interval))
             if not stop_event.is_set():
                 app.rescan()
-    threading.Thread(target=loop, daemon=True).start()
-
-    httpd = None
-    if not args.no_server:
-        try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_fleet_handler(app))
-            print(f"  dashboard: http://127.0.0.1:{args.port}")
-        except OSError as e:
-            print(f"  [!] could not bind port {args.port}: {e}")
-    print("  (Ctrl+C to stop)\n")
     try:
+        worker = threading.Thread(target=loop, daemon=True)
+        worker.start()
+        if not args.no_server:
+            try:
+                httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_fleet_handler(app))
+                print(f"  dashboard: http://127.0.0.1:{httpd.server_port}")
+            except OSError as e:
+                print(f"  [!] could not bind port {args.port}: {e}")
+        print("  (Ctrl+C to stop)\n")
         if httpd:
             httpd.serve_forever()
         else:
@@ -2864,8 +4345,13 @@ def run_fleet(args, root: str):
         print("\n[gitreal] fleet stopped.")
     finally:
         stop_event.set()
+        if worker is not None:
+            try:
+                worker.join(timeout=2)
+            except RuntimeError:
+                pass  # A thread whose start failed cannot be joined.
         if httpd:
-            httpd.shutdown()
+            httpd.server_close()
 
 
 # ----------------------------------------------------------------------------
@@ -2873,7 +4359,7 @@ def run_fleet(args, root: str):
 # ----------------------------------------------------------------------------
 WIRE_BEGIN = "<!-- GIT_REAL hook -->"
 WIRE_END = "<!-- /GIT_REAL -->"
-# Fixed basenames plus symlink rejection keep writes at the requested files.
+# Fixed basenames, complete preflight and alias rejection bound instruction writes.
 WIRE_TARGETS = ("CLAUDE.md", "AGENTS.md", ".cursorrules")
 WIRE_DEFAULT = "AGENTS.md"   # created if none of the targets exist yet
 
@@ -2907,43 +4393,117 @@ def wire_block() -> str:
     ])
 
 
-def _wire_one(path: str, block: str) -> str:
-    """Insert or replace the managed block in one file. Returns the action taken:
-    created / updated / inserted / unchanged."""
-    if os.path.islink(path):
-        raise OSError("Refusing to rewrite a symlinked agent instruction file")
-    if not os.path.isfile(path):
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(block + "\n")
+def _wire_read(path: str) -> tuple[bytes, tuple] | None:
+    """Read one regular, singly linked file without following its final symlink."""
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise OSError(f"Refusing aliased or nonregular agent instruction file: {path}")
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_nlink, s.st_size, s.st_mtime_ns)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        if identity(opened) != identity(before):
+            raise OSError(f"Agent instruction file changed before reading: {path}")
+        data = source.read()
+        if identity(os.fstat(source.fileno())) != identity(opened):
+            raise OSError(f"Agent instruction file changed while reading: {path}")
+    return data, identity(opened)
+
+
+def _wire_plan(path: str, block: str) -> dict:
+    original = _wire_read(path)
+    data = original[0] if original is not None else b""
+    lines = data.splitlines(keepends=True)
+    newline = b"\n"
+    for line in lines:
+        if line.endswith(b"\r\n"):
+            newline = b"\r\n"
+            break
+        if line.endswith((b"\n", b"\r")):
+            newline = line[-1:]
+            break
+    replacement = block.encode("utf-8").replace(b"\n", newline)
+    begin, end = WIRE_BEGIN.encode(), WIRE_END.encode()
+    if begin in data or end in data:
+        starts, ends, offset = [], [], 0
+        for index, line in enumerate(lines):
+            text = line.rstrip(b"\r\n")
+            bom = 3 if index == 0 and text.startswith(b"\xef\xbb\xbf") else 0
+            text = text[bom:]
+            if text == begin:
+                starts.append(offset + bom)
+            if text == end:
+                ends.append(offset + bom + len(end))
+            offset += len(line)
+        if (len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]
+                or data.count(begin) != 1 or data.count(end) != 1):
+            raise OSError(f"Agent instruction markers must be one ordered pair on complete lines: {path}")
+        updated = data[:starts[0]] + replacement + data[ends[0]:]
+        action = "unchanged" if updated == data else "updated"
+    else:
+        separator = b"" if not data or data.endswith(newline * 2) else (newline if data.endswith(newline) else newline * 2)
+        updated = data + separator + replacement + newline
+        action = "created" if original is None else "inserted"
+    return {"original": original, "updated": updated, "action": action}
+
+
+def _wire_apply(path: str, plan: dict) -> str:
+    if _wire_read(path) != plan["original"]:
+        raise OSError(f"Agent instruction file changed after preflight: {path}")
+    if plan["action"] == "unchanged":
+        return "unchanged"
+    if plan["original"] is None:
+        # Exclusive creation cannot replace a file that appeared after preflight.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(path, flags, 0o666)
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(plan["updated"])
         return "created"
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        content = fh.read()
-    if WIRE_BEGIN in content and WIRE_END in content:
-        start = content.index(WIRE_BEGIN)
-        end = content.index(WIRE_END, start) + len(WIRE_END)
-        new = content[:start] + block + content[end:]
-        if new == content:
-            return "unchanged"
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(new)
-        return "updated"
-    # append, keeping a blank line of separation from existing content
-    sep = "" if content.endswith("\n\n") else ("\n" if content.endswith("\n") else "\n\n")
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(sep + block + "\n")
-    return "inserted"
+    descriptor, temporary = tempfile.mkstemp(prefix=".gitreal-wire-", dir=os.path.dirname(path) or ".")
+    temporary_stat = os.fstat(descriptor)
+    temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(plan["updated"])
+        os.chmod(temporary, stat.S_IMODE(plan["original"][1][2]))
+        if _wire_read(path) != plan["original"]:
+            raise OSError(f"Agent instruction file changed before replacement: {path}")
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                remaining = os.lstat(temporary)
+            except FileNotFoundError:
+                pass
+            else:
+                if (remaining.st_dev, remaining.st_ino) == temporary_identity:
+                    os.unlink(temporary)
+    return plan["action"]
+
+
+def _wire_one(path: str, block: str) -> str:
+    """Preserve bytes outside one managed range; return its actual write result."""
+    return _wire_apply(path, _wire_plan(path, block))
 
 
 def wire_agents(root: str) -> dict:
     """Idempotently install the GIT_REAL agent hook into the repo's agent rule files.
     Updates every one of CLAUDE.md / AGENTS.md / .cursorrules that already exists; if none
-    exist, creates AGENTS.md. Never touches any other file and never writes outside `root`.
-    Returns {filename: action}."""
+    exist, creates AGENTS.md. Preflight every selected file before applying edits.
+    Returns {filename: action}. This is not a multi-file transaction or writer lock."""
     root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise OSError(f"Agent wiring requires an existing directory: {root}")
     block = wire_block()
-    existing = [n for n in WIRE_TARGETS if os.path.isfile(os.path.join(root, n))]
+    existing = [n for n in WIRE_TARGETS if os.path.lexists(os.path.join(root, n))]
     targets = existing or [WIRE_DEFAULT]
-    return {name: _wire_one(os.path.join(root, name), block) for name in targets}
+    plans = {name: _wire_plan(os.path.join(root, name), block) for name in targets}
+    return {name: _wire_apply(os.path.join(root, name), plans[name]) for name in targets}
 
 
 # ----------------------------------------------------------------------------
@@ -2961,7 +4521,9 @@ def main():
     ap.add_argument("--json", dest="json_output", action="store_true",
                     help="print a fresh JSON snapshot without writing dashboard files")
     ap.add_argument("--operation", choices=tuple(ACTION_SCOPES), help="assess one exact operation without executing it")
-    ap.add_argument("--target", help="explicit reset commit or selected stash ref")
+    ap.add_argument("--stage-path", action="append", default=[], help="pathspec for --operation stage_paths; repeat for multiple pathspecs")
+    ap.add_argument("--target", help="exact refs/heads/<name> for branch/origin checks, reset commit or selected stash ref")
+    ap.add_argument("--expect-binding", help="fail closed unless a fresh ref-operation input_binding matches this digest")
     ap.add_argument("--request-id", help="echo a caller's unique refresh token in the snapshot")
     ap.add_argument("--init", action="store_true", help="git init if PATH is not a repo")
     ap.add_argument("--all", "--fleet", dest="all", action="store_true",
@@ -2974,8 +4536,24 @@ def main():
                     help="install the GIT_REAL hook into CLAUDE.md / AGENTS.md / .cursorrules "
                          "(idempotent; creates AGENTS.md if none exist) and exit")
     args = ap.parse_args()
-    if args.target is not None and args.operation not in ("reset_hard", "drop_stash"):
-        ap.error("--target requires --operation reset_hard or drop_stash")
+    if not (0 < args.interval < float("inf")):
+        ap.error("--interval must be finite and greater than zero")
+    if args.json_output and (args.init or args.wire_agents):
+        ap.error("--json cannot initialize Git or write agent instructions")
+    if args.repos_file and not args.all:
+        ap.error("--repos-file requires --fleet")
+    if args.target is not None and args.operation not in ("reset_hard", "drop_stash", *REF_ACTIONS):
+        ap.error("--target requires an exact target-bearing operation")
+    if args.expect_binding is not None and args.operation not in REF_ACTIONS:
+        ap.error("--expect-binding requires a branch/integration/origin-push assessment")
+    if args.operation and (args.init or args.wire_agents):
+        ap.error("read-only operation assessments cannot initialize Git or write agent instructions")
+    if args.stage_path and args.operation != "stage_paths":
+        ap.error("--stage-path requires --operation stage_paths")
+    if args.operation == "stage_paths" and not args.stage_path:
+        ap.error("--operation stage_paths requires at least one --stage-path")
+    if args.operation == "stage_paths" and not args.json_output:
+        ap.error("--operation stage_paths requires --json")
     if args.operation and not (args.once or args.json_output):
         ap.error("--operation requires --once or --json")
     if args.all and (args.json_output or args.operation or args.target):
@@ -2987,7 +4565,11 @@ def main():
         sys.exit(1)
 
     if args.wire_agents:
-        results = wire_agents(root)
+        try:
+            results = wire_agents(root)
+        except OSError as exc:
+            print(f"[gitreal] agent wiring failed: {exc}", file=sys.stderr)
+            sys.exit(1)
         for name, action in results.items():
             print(f"[gitreal] {action:9} {os.path.join(root, name)}")
         print("[gitreal] agent hook points at .git-real/git-real.json - "
@@ -2995,18 +4577,19 @@ def main():
         sys.exit(0)
 
 
-    if getattr(args, "repos_file", None) and not args.all:
-        print("[gitreal] --repos-file requires --fleet", file=sys.stderr)
-        sys.exit(2)
-
     if args.all:
         run_fleet(args, root)
         return
 
     if args.json_output:
-        state = build_state(GitRepo(root), {"quick": args.quick, "request_id": args.request_id})
-        if args.operation:
-            state["requested_action"] = assess_action(state, args.operation, args.target)
+        if args.operation == "stage_paths":
+            state = stage_paths_state(root, args.stage_path, quick=args.quick, request_id=args.request_id)
+        else:
+            state = build_state(GitRepo(root), {"quick": args.quick, "request_id": args.request_id,
+                                                "operation": args.operation, "target": args.target,
+                                                "expected_binding": args.expect_binding})
+            if args.operation and "requested_action" not in state:
+                requested_action(state, args.operation, args.target, args.expect_binding)
         print(json.dumps(state, ensure_ascii=True))
         if not state.get("read_complete"):
             sys.exit(2)
@@ -3017,7 +4600,8 @@ def main():
         return
 
     app = App(root, args.port, args.interval)
-    app.config.update(quick=args.quick, request_id=args.request_id)
+    app.config.update(quick=args.quick, request_id=args.request_id, operation=args.operation,
+                      target=args.target, expected_binding=args.expect_binding)
 
     if args.init and not app.repo.is_repo():
         print(f"[gitreal] git init {root}")
@@ -3026,8 +4610,8 @@ def main():
     app.rescan()
     s = app.state
     sc = s.get("scores", {})
-    if args.operation:
-        s["requested_action"] = assess_action(s, args.operation, args.target)
+    if args.operation and "requested_action" not in s:
+        requested_action(s, args.operation, args.target, args.expect_binding)
         app._write_outputs()
 
     if args.once:
@@ -3051,32 +4635,35 @@ def main():
     print(f"  watcher  : {'polling' if use_poll else 'watchdog (events)'}")
 
     stop_event = threading.Event()
-    if not use_poll:
-        try:
-            start_watchdog(app)
-        except Exception:  # noqa: BLE001
-            print("  watchdog not available -> falling back to polling")
-            use_poll = True
-    if use_poll:
-        start_polling(app, stop_event)
-    # periodic safety rescan catches index/commit changes that emit no fs events
-    def safety():
-        while not stop_event.is_set():
-            stop_event.wait(max(8, app.interval * 2))
-            if not stop_event.is_set():
-                app.rescan()
-    threading.Thread(target=safety, daemon=True).start()
-
+    watcher = None
+    safety_thread = None
     httpd = None
-    if not args.no_server:
-        try:
-            httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
-            print(f"  dashboard: http://127.0.0.1:{args.port}")
-        except OSError as e:
-            print(f"  [!] could not bind port {args.port}: {e} (use --port N or --no-server)")
-    print("  (Ctrl+C to stop)\n")
-
     try:
+        if not use_poll:
+            try:
+                watcher = start_watchdog(app)
+            except Exception:  # noqa: BLE001
+                print("  watchdog not available -> falling back to polling")
+                use_poll = True
+        if use_poll:
+            watcher = start_polling(app, stop_event)
+        # periodic safety rescan catches index/commit changes that emit no fs events
+        def safety():
+            while not stop_event.is_set():
+                stop_event.wait(max(8, app.interval * 2))
+                if not stop_event.is_set():
+                    app.rescan()
+        safety_thread = threading.Thread(target=safety, daemon=True)
+        safety_thread.start()
+
+        if not args.no_server:
+            try:
+                httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(app))
+                print(f"  dashboard: http://127.0.0.1:{args.port}")
+            except OSError as e:
+                print(f"  [!] could not bind port {args.port}: {e} (use --port N or --no-server)")
+        print("  (Ctrl+C to stop)\n")
+
         if httpd:
             httpd.serve_forever()
         else:
@@ -3086,8 +4673,16 @@ def main():
         print("\n[gitreal] stopped.")
     finally:
         stop_event.set()
+        if watcher is not None:
+            if hasattr(watcher, "stop"):
+                watcher.stop()
+            watcher.join(timeout=2)
+        if safety_thread is not None:
+            safety_thread.join(timeout=2)
         if httpd:
-            httpd.shutdown()
+            # serve_forever has already unwound in this thread. Release our
+            # socket explicitly; shutdown alone does not close it.
+            httpd.server_close()
 
 
 if __name__ == "__main__":

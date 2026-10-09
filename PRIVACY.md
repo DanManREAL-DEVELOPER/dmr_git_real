@@ -10,7 +10,7 @@ configured by the user.
 
 ## Data GIT_REAL reads
 
-GIT_REAL v1.2 reads Git and filesystem metadata needed to assess repository
+GIT_REAL v1.3.1 reads Git and filesystem metadata needed to assess repository
 operations, including:
 
 - repository and file names;
@@ -21,7 +21,7 @@ operations, including:
 - remote URLs after embedded HTTP credentials are redacted;
 - SSH identity key basenames, never key contents.
 
-GIT_REAL v1.2 deliberately does not inspect repository file contents for
+GIT_REAL v1.3.1 deliberately does not inspect repository file contents for
 secrets.
 
 ## Data written locally
@@ -38,7 +38,7 @@ it.
 
 ## Data not collected
 
-GIT_REAL shas no account system, telemetry client, analytics identifier,
+GIT_REAL has no account system, telemetry client, analytics identifier,
 advertising SDK, or hosted data store.
 
 ## Public examples
@@ -46,3 +46,7 @@ advertising SDK, or hosted data store.
 Documentation and tests use synthetic identities, `example.invalid` addresses,
 and disposable repositories. The release gate rejects common personal
 absolute-path shapes from the public text surface.
+
+The release gate inspects tracked files and nonignored candidate files. Ignored
+local reports are outside that Git release surface. Tracked symlinks and oversized
+text are refused rather than silently skipped. Review binary branding assets separately.

@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import sys
 import hashlib
+import inspect
 
 # import the canonical GIT_REAL tool that lives next to this file
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,14 +51,16 @@ def _adapter_current() -> bool:
     return current == _ADAPTER_SOURCE_SHA256
 
 
-def _state(path: str) -> dict:
-    state = gitreal.build_state(gitreal.GitRepo(_abs(path)), _CFG)
+def _state(path: str, config: dict | None = None) -> dict:
+    state = gitreal.build_state(gitreal.GitRepo(_abs(path)), {**_CFG, **(config or {})})
     if not _adapter_current():
         state["read_complete"] = False
         state["read_errors"].append("MCP adapter changed after startup; reconnect this server.")
         state["scores"] = gitreal.compute_scores(state)
         state["actions"] = {name: gitreal.assess_action(state, name)
                             for name in state.get("actions", {})}
+        if config and config.get("operation") in gitreal.REF_ACTIONS:
+            gitreal.requested_action(state, config["operation"], config.get("target"), config.get("expected_binding"))
         state["closeout"] = gitreal.closeout_state(state)
     return state
 
@@ -65,19 +68,45 @@ def _state(path: str) -> dict:
 # ---------------------------------------------------------------------------
 # plain logic (independently testable, no MCP required)
 # ---------------------------------------------------------------------------
-def get_status(path: str = ".") -> dict:
-    s = _state(path)
+def get_status(path: str = ".", operation: str | None = None, target: str | None = None,
+               request_id: str | None = None, expected_binding: str | None = None) -> dict:
+    assessment_requested = operation is not None or target is not None or expected_binding is not None
+    if assessment_requested and operation not in gitreal.REF_ACTIONS:
+        # Invalid optional assessment inputs must not fall through to ordinary
+        # status, which can invoke a configured clean/process filter.
+        s = {"schema_version": gitreal.SCHEMA_VERSION, "root": _abs(path),
+             "read_complete": False, "read_errors": [
+                 "Status operation checks support only exact branch/integration/origin-push operations; no Git inspection ran."],
+             "request_id": request_id, "publication_id": None, "status": {}}
+        gitreal.requested_action(s, operation, target, expected_binding)
+        return {**s, "is_repo": None, "path": s["root"], "generated_at": None}
+    s = _state(path, {"operation": operation, "target": target, "request_id": request_id,
+                      "expected_binding": expected_binding})
+    if assessment_requested and "requested_action" not in s:
+        gitreal.requested_action(s, operation, target, expected_binding)
     sc, st = s.get("scores", {}), s.get("status", {})
-    if not s.get("is_repo"):
+    # Only a confirmed non-repository gets this short answer. A read stopped at
+    # admission (e.g. stale source) has unknown is_repo and keeps the full
+    # incomplete projection, so it cannot be mistaken for "not a repository".
+    if s.get("is_repo") is False:
         return {"is_repo": False, "path": _abs(path), "read_complete": False,
                 "schema_version": s.get("schema_version"), "read_errors": s.get("read_errors"),
+                **({"requested_action": s["requested_action"], "actions": s["actions"],
+                    "request_id": s.get("request_id"), "publication_id": s.get("publication_id")}
+                   if "requested_action" in s else {}),
                 "message": "Not a git repository."}
+    unpushed = [{"hash": c.get("hash"), "subject": c.get("subject")}
+                for c in s.get("unpushed", [])[:_UNPUSHED_PREVIEW]]
+    preview_total = s["branch_ahead_commit_count"] if s["read_complete"] else None
     return {
         "schema_version": s["schema_version"], "version": s["version"],
         "engine_source_sha256": s["engine_source_sha256"],
         "generated_at": s["generated_at"], "publication_id": s["publication_id"],
+        "request_id": s.get("request_id"),
+        **({"requested_action": s["requested_action"]} if "requested_action" in s else {}),
         "read_complete": s["read_complete"], "read_errors": s["read_errors"],
         "root": s["root"], "status": st, "scores": sc, "actions": s["actions"],
+        "object_storage": s["object_storage"],
         "elapsed_ms": s["elapsed_ms"], "closeout": s["closeout"],
         "main_equals_origin_main": s["main_equals_origin_main"],
         "main_oid": s["main_oid"], "origin_main_oid": s["origin_main_oid"],
@@ -94,7 +123,7 @@ def get_status(path: str = ".") -> dict:
         "index_inventory": s["index_inventory"],
         "hidden_path_count": len(s["index_inventory"]["hidden_paths"]) if s["read_complete"] else None,
         "active_operations": s["active_operations"], "index_locked": s["index_locked"],
-        "is_repo": True, "path": s["root"], "name": s["root_name"],
+        "is_repo": s.get("is_repo"), "path": s["root"], "name": s["root_name"],
         "branch": "(detached)" if st.get("detached") else st.get("branch"),
         "upstream": st.get("upstream"), "ahead": st.get("ahead"), "behind": st.get("behind"),
         "safe_commit_pct": sc.get("safe_commit"), "safe_commit_verdict": sc.get("safe_commit_label"),
@@ -114,8 +143,15 @@ def get_status(path: str = ".") -> dict:
                            "merged_into_default": b.get("merged_into_default"),
                            "pushed": b.get("pushed")}
                           for b in s.get("side_branches", [])],
-        "unpushed": [{"hash": c.get("hash"), "subject": c.get("subject")}
-                     for c in s.get("unpushed", [])[:_UNPUSHED_PREVIEW]],
+        "unpushed": unpushed,
+        # Subject coverage is current-upstream only, unlike the all-local-ref count.
+        "unpushed_preview": {
+            "scope": "CURRENT_BRANCH_LOCAL_UPSTREAM", "upstream": st.get("upstream"),
+            "limit": _UNPUSHED_PREVIEW, "returned_count": len(unpushed),
+            "total_count": preview_total,
+            "complete": preview_total is not None and len(unpushed) == preview_total,
+            "truncated": len(unpushed) < preview_total if preview_total is not None else None,
+        },
         # --- v1.1 situational awareness ---
         # (#3) is this its own repo, or tracked inside a parent (half-extracted)?
         "topology": s.get("topology", {}),
@@ -143,14 +179,22 @@ def check_commit(path: str = ".") -> dict:
         "path": s.get("root", _abs(path)),
         "safe_commit_pct": pct,
         "verdict": "SAFE FOR INSPECTED INDEX" if action["safe"] else "COMMIT NOT APPROVED",
-        # Mirrors the engine's 80/40 bands (safe_commit_label) so this surface can
-        # never say a plain OK below the governance GO bar (§6: commit needs >= 80).
+        # Only the engine's exact operation decision authorizes this verdict.
         "recommendation": "OK" if action["safe"] else "BLOCK",
     }
 
 
 def check_discard(path: str = ".", operation: str | None = None, target: str | None = None) -> dict:
-    s = _state(path)
+    discard_operations = ("discard_tracked", "clean_untracked", "clean_ignored", "reset_hard", "drop_stash")
+    needs_target = operation in ("reset_hard", "drop_stash")
+    valid_target = (isinstance(target, str) and bool(target.strip())) if needs_target else target is None
+    if operation not in discard_operations or not valid_target:
+        # Malformed or wrong-tool requests must not cause repository inspection.
+        s = {"schema_version": gitreal.SCHEMA_VERSION, "root": _abs(path),
+             "generated_at": None, "publication_id": None, "read_complete": False,
+             "read_errors": ["A supported discard operation with its applicable target is required; no Git inspection ran."]}
+    else:
+        s = _state(path)
     sc = s.get("scores", {})
     action = gitreal.assess_action(s, operation, target)
     return {
@@ -162,8 +206,7 @@ def check_discard(path: str = ".", operation: str | None = None, target: str | N
         "verdict": "SAFE FOR EXACT OPERATION" if action["safe"] else "DISCARD NOT APPROVED",
         "stashes": s.get("stash_summary", {}),      # (#2) unmerged work survives a discard
         "topology": s.get("topology", {}).get("kind"),
-        # Same banding as safe_delete_label: discard is destructive, so the 40-79
-        # zone must read as review-first, never as a green light.
+        # Summary scores do not approve another operation or later state.
         "recommendation": "OK_TO_DISCARD" if action["safe"] else "DO_NOT_DISCARD",
     }
 
@@ -172,20 +215,32 @@ def check_discard(path: str = ".", operation: str | None = None, target: str | N
 
 def get_fleet(root: str = ".") -> dict:
     r = _abs(root)
-    if not os.path.isdir(r) or not _adapter_current():
+    def incomplete(message: str) -> dict:
         return {"root": r, "schema_version": gitreal.SCHEMA_VERSION,
-                "read_complete": False, "read_errors": ["Invalid fleet root or outdated MCP process; refresh/reconnect."],
-                "totals": {}, "repos": []}
+                "read_complete": False, "read_errors": [message], "totals": {}, "repos": []}
+
+    if not os.path.isdir(r) or not _adapter_current():
+        return incomplete("Invalid fleet root or outdated MCP process; refresh/reconnect.")
     projection = os.path.join(r, "governance", "generated", "REPOSITORY_FLEET.json")
     registry_paths = []
     info = {}
-    if os.path.isfile(projection):
-        registry_paths = gitreal.load_registry_repo_paths(projection)
-        info = gitreal.registry_fleet_paths(r, registry_paths)
-        paths = list(info.get("present") or [])
+    if os.path.lexists(projection):
+        if not os.path.isfile(projection):
+            return incomplete("Fleet registry is not a regular readable file; no discovery fallback ran.")
+        try:
+            registry_paths = gitreal.load_registry_repo_paths(projection)
+            info = gitreal.registry_fleet_paths(r, registry_paths)
+            paths = list(info.get("present") or [])
+        except (OSError, ValueError):
+            return incomplete("Fleet registry is unreadable or invalid; no discovery fallback ran.")
     else:
-        paths = gitreal.discover_repos(r)
+        try:
+            paths = gitreal.discover_repos(r)
+        except (OSError, ValueError):
+            return incomplete("Fleet discovery could not be completed; no complete inventory is claimed.")
     fs = gitreal.build_fleet_state(r, paths, _CFG, registry_paths=registry_paths or None)
+    if not _adapter_current():
+        return incomplete("MCP adapter changed during fleet inspection; reconnect and inspect again.")
     return {
         "root": r,
         "schema_version": gitreal.SCHEMA_VERSION,
@@ -201,6 +256,7 @@ def get_fleet(root: str = ".") -> dict:
             "branch": x.get("branch"), "schema_version": x.get("schema_version"),
             "read_complete": x.get("read_complete"), "error": x.get("error"),
             "actions": x.get("actions", {}), "closeout": x.get("closeout", {}),
+            "object_storage": x.get("object_storage", {}),
             "main_equals_origin_main": x.get("main_equals_origin_main"),
             "extra_worktree_count": x.get("extra_worktree_count"),
             "safe_commit_pct": x.get("safe_commit"), "safe_discard_pct": x.get("safe_delete"),
@@ -218,6 +274,8 @@ def get_fleet(root: str = ".") -> dict:
 
 
 def do_gitignore_add(path: str = ".", pattern: str = "") -> dict:
+    if not isinstance(pattern, str) or not pattern.strip() or any(c in pattern for c in ("\n", "\r", "\0")):
+        return {"ok": False, "path": _abs(path), "error": "One nonempty ignore pattern is required; no Git inspection ran."}
     state = _state(path)
     if state.get("read_complete") is not True or state.get("topology", {}).get("kind") != "own_repo":
         return {"ok": False, "path": _abs(path), "error": "A fresh, readable repository root is required."}
@@ -237,25 +295,46 @@ except Exception:  # noqa: BLE001
 if _HAVE_MCP:
     mcp = FastMCP("git-real")
 
-    @mcp.tool()
-    def git_real_status(path: str = ".") -> dict:
+    # Older supported SDKs have no annotation type/keyword. Keep registration
+    # available there, while giving capable clients explicit mutation metadata.
+    try:
+        from mcp.types import ToolAnnotations
+    except ImportError:
+        ToolAnnotations = None
+
+    def _tool(*, read_only: bool = True):
+        if ToolAnnotations is not None and "annotations" in inspect.signature(mcp.tool).parameters:
+            return mcp.tool(annotations=ToolAnnotations(
+                readOnlyHint=read_only, destructiveHint=False,
+                idempotentHint=True, openWorldHint=False))
+        return mcp.tool()
+
+    @_tool()
+    def git_real_status(path: str = ".", operation: str | None = None, target: str | None = None,
+                        request_id: str | None = None, expected_binding: str | None = None) -> dict:
         """Fresh schema-2 metadata for the actual repository root: complete/error state,
         exact operation decisions, conflicts, ignored and hidden-index counts, stashes,
-        branches, worktrees and local-ref closeout evidence. Unpushed counts cover all
-        local refs; commit subjects are a bounded current-upstream preview. Remote state
-        uses LOCAL_TRACKING_REFS_ONLY, not live network verification. Deep stash and
+        branches, worktrees, local-ref closeout and object-storage backlog evidence.
+        Optional operation: create_branch, switch_branch, fast_forward, delete_branch or
+        push_origin. Requires an exact refs/heads/<name> target and fresh request_id;
+        expected_binding revalidates a previous input_binding without executing Git.
+        Require matching requested_action/actions entry ALLOW and safe=true. Git-safety
+        evidence never grants ownership or publication authority.
+        Unpushed counts cover all local refs; unpushed_preview reports the scope, exact
+        total and truncation of the bounded current-upstream subjects, not publication
+        proof. Remote state uses LOCAL_TRACKING_REFS_ONLY, not live network verification. Deep stash and
         push-weight telemetry are deferred for speed. Scores never authorize deletion.
         Reconnect after source upgrades; a stale loaded process fails closed."""
-        return get_status(path)
+        return get_status(path, operation, target, request_id, expected_binding)
 
-    @mcp.tool()
+    @_tool()
     def is_safe_to_commit(path: str = ".") -> dict:
         """Check a plain commit of the inspected index. Require safe=true and decision=ALLOW.
         Does not approve commit -a, path arguments, amend, or a future modified index.
         No staged candidate is BLOCK, not approval to stage arbitrary working files."""
         return check_commit(path)
 
-    @mcp.tool()
+    @_tool()
     def is_safe_to_discard(path: str = ".", operation: str | None = None, target: str | None = None) -> dict:
         """Read-only safety check for one EXACT operation: discard_tracked, clean_untracked,
         clean_ignored, reset_hard (requires target commit), or drop_stash (requires stash ref).
@@ -265,7 +344,7 @@ if _HAVE_MCP:
         return check_discard(path, operation, target)
 
 
-    @mcp.tool()
+    @_tool()
     def git_real_fleet(root: str = ".") -> dict:
         """Read selected repositories from the fleet registry, or bounded folder discovery.
         Returns per-repository schema-2 actions, closeout evidence and inventory errors.
@@ -273,7 +352,7 @@ if _HAVE_MCP:
         exclude selected repositories from totals. This is not blanket action permission."""
         return get_fleet(root)
 
-    @mcp.tool()
+    @_tool(read_only=False)
     def gitignore_add(path: str = ".", pattern: str = "") -> dict:
         """Append a pattern to a repo's .gitignore (e.g. 'dist/' or '.env')."""
         return do_gitignore_add(path, pattern)

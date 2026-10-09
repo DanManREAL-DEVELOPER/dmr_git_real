@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed public release gate for GIT_REAL v1.2."""
+"""Fail-closed public release gate for GIT_REAL v1.3.1."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ GENERIC_PRIVATE_PATTERNS = (
     ("POSIX home path", re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+/")),
     (
         "Windows user path",
-        re.compile(r"[A-Za-z]:\\\\Users\\\\[^\\\\\s]+", re.IGNORECASE),
+        re.compile(r"[A-Za-z]:\\+Users\\+[^\\\s]+", re.IGNORECASE),
     ),
     (
         "WSL user path",
@@ -83,19 +83,26 @@ def run(command: list[str]) -> tuple[int, str]:
             check=False,
             timeout=240,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
         return 1, str(exc)
     return result.returncode, (result.stdout + result.stderr).strip()
 
 
 def iter_public_files():
-    for path in ROOT.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(ROOT)
-        if any(part in SKIP_DIRS for part in relative.parts):
-            continue
-        yield path, relative
+    """Inspect tracked plus nonignored candidates, never ignored local reports."""
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT, capture_output=True, check=False, timeout=30,
+    )
+    if result.returncode or (result.stdout and not result.stdout.endswith(b"\0")):
+        raise ValueError("Public file inventory is unavailable or incomplete")
+    for name in sorted(set(result.stdout.split(b"\0")) - {b""}):
+        relative = Path(os.fsdecode(name))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("Public file inventory contains an unsafe path")
+        path = ROOT / relative
+        if path.is_file() or path.is_symlink():
+            yield path, relative
 
 
 def privacy_failures() -> list[str]:
@@ -108,17 +115,24 @@ def privacy_failures() -> list[str]:
         ).split(",")
         if item.strip()
     ]
-    for path, relative in iter_public_files():
+    try:
+        files = list(iter_public_files())
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return ["public file inventory failed: " + str(exc)]
+    for path, relative in files:
+        if path.is_symlink():
+            failures.append(f"symlink in public release surface: {relative}")
+            continue
         if (
             path.name in FORBIDDEN_NAMES
             or path.name.startswith(".env.")
             and path.name != ".env.example"
         ):
             failures.append(f"forbidden sensitive filename: {relative}")
-        if (
-            path.suffix.lower() not in TEXT_SUFFIXES
-            or path.stat().st_size > 2_000_000
-        ):
+        if path.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        if path.stat().st_size > 2_000_000:
+            failures.append(f"text exceeds bounded privacy inspection: {relative}")
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -192,20 +206,29 @@ def verify_engine_parity(
     ).strip()
     if not private_source_value:
         return
-    private_source = (
-        Path(private_source_value)
-        .expanduser()
-        .resolve()
-    )
-    if not private_source.is_dir():
+    try:
+        private_source = (
+            Path(private_source_value)
+            .expanduser()
+            .resolve()
+        )
+        is_directory = private_source.is_dir()
+    except (OSError, RuntimeError, ValueError) as exc:
+        failures.append(f"private source is unavailable: {exc}")
+        return
+    if not is_directory:
         failures.append(
             f"private source is not a directory: {private_source}"
         )
         return
     for name in ("gitreal.py", "gitreal_mcp.py"):
-        if (ROOT / name).read_bytes() != (
-            private_source / name
-        ).read_bytes():
+        try:
+            public_bytes = (ROOT / name).read_bytes()
+            private_bytes = (private_source / name).read_bytes()
+        except (OSError, RuntimeError, ValueError) as exc:
+            failures.append(f"engine parity unavailable for {name}: {exc}")
+            continue
+        if public_bytes != private_bytes:
             failures.append(
                 f"engine drift from private source: {name}"
             )
@@ -234,22 +257,40 @@ def verify_fresh_self_state(
             "fresh self-state was not valid JSON"
         )
         return
-    expected_root = ROOT.resolve()
-    observed_root = Path(
-        str(state.get("root") or "")
-    ).resolve()
+    if not isinstance(state, dict):
+        failures.append("fresh self-state was not a JSON object")
+        return
+    root_matches = False
+    root_value = state.get("root")
+    if isinstance(root_value, str) and root_value:
+        try:
+            observed_root = Path(root_value)
+            root_matches = (
+                observed_root.is_absolute()
+                and observed_root.resolve() == ROOT.resolve()
+            )
+        except (OSError, RuntimeError, ValueError):
+            root_matches = False
+    read_errors = state.get("read_errors")
+    actions = state.get("actions")
+    commit_action = (
+        actions.get("commit_index")
+        if isinstance(actions, dict)
+        else None
+    )
     checks = {
-        "version": state.get("version") == "1.2.0",
+        "version": state.get("version") == "1.3.1",
         "schema_version": state.get("schema_version") == 2,
         "is_repo": state.get("is_repo") is True,
         "read_complete": state.get("read_complete") is True,
-        "read_errors": not state.get("read_errors"),
-        "root": observed_root == expected_root,
+        "read_errors": isinstance(read_errors, list) and not read_errors,
+        "root": root_matches,
         "commit_index_action": (
-            (state.get("actions") or {})
-            .get("commit_index", {})
-            .get("operation")
-            == "commit_index"
+            isinstance(commit_action, dict)
+            and commit_action.get("operation") == "commit_index"
+            and isinstance(commit_action.get("safe"), bool)
+            and commit_action.get("decision")
+            == ("ALLOW" if commit_action["safe"] else "BLOCK")
         ),
     }
     for label, passed in checks.items():
@@ -258,7 +299,7 @@ def verify_fresh_self_state(
                 f"fresh self-state check failed: {label}"
             )
     if all(checks.values()):
-        print("PASS fresh v1.2 self-state")
+        print("PASS fresh v1.3.1 self-state")
 
 
 def main() -> int:
@@ -283,14 +324,8 @@ def main() -> int:
             "-m",
             "pytest",
             "-q",
-            "tests/test_setup_gitreal.py",
-            "tests/test_adversarial_safety.py",
-            "tests/test_wave43_grc.py",
+            "tests",
         ],
-        [sys.executable, "tests/test_mcp_status.py"],
-        [sys.executable, "tests/test_v11_situational.py"],
-        [sys.executable, "tests/test_verdict_scoring.py"],
-        [sys.executable, "tests/test_wire_agents.py"],
     ]
     for command in commands:
         code, output = run(command)
@@ -301,6 +336,8 @@ def main() -> int:
             )
         else:
             print(f"PASS {label}")
+            if output:
+                print(output)
 
     verify_fresh_self_state(failures)
 

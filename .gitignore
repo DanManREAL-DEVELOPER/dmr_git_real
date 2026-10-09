@@ -10,3 +10,6 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# Local audit and project map artifacts
+/.project-map/
