@@ -95,3 +95,20 @@ def test_new_large_file_still_blocks(tmp_path):
     action = commit_verdict(repo, "big.bin")
     assert action["decision"] == "BLOCK"
     assert any("large file" in reason for reason in action["reasons"])
+
+
+def test_resolved_history_only_merge_can_be_committed(tmp_path):
+    repo = tmp_path / "repo"
+    initialize(repo, {"a.txt": b"one\n"})
+    git(repo, "switch", "-q", "-c", "side")
+    (repo / "a.txt").write_text("two\n")
+    git(repo, "commit", "-qam", "side change")
+    git(repo, "switch", "-q", "main")
+    (repo / "a.txt").write_text("two\n")
+    git(repo, "commit", "-qam", "same change on main")
+    git(repo, "merge", "--no-ff", "--no-commit", "side")
+    state = g.build_state(g.GitRepo(str(repo)), {"quick": True})
+    assert state["actions"]["commit_index"]["decision"] == "ALLOW", state["actions"]["commit_index"]["reasons"]
+    git(repo, "merge", "--abort")
+    state = g.build_state(g.GitRepo(str(repo)), {"quick": True})
+    assert state["actions"]["commit_index"]["decision"] == "BLOCK"

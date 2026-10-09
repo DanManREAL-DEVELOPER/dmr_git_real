@@ -2014,7 +2014,8 @@ def assess_action(state: dict, operation: str | None, target: str | None = None,
             reasons.extend(_maintenance_hazards(state))
         elif operation == "commit_index":
             scores = state.get("scores") or {}
-            if not st.get("staged"):
+            # A verified, fully resolved merge may record history with no content change.
+            if not st.get("staged") and not (state.get("active_operations") and resolved_merge_commit(state)):
                 reasons.append("No staged changes; this is a preview, not a commit approval.")
             if scores.get("safe_commit_band") != "GO" or scores.get("safe_commit", 0) < 80:
                 reasons.extend(scores.get("safe_commit_reasons") or ["Commit hazards require review."])
