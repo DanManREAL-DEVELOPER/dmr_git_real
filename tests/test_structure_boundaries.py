@@ -26,7 +26,9 @@ def load(source,root):
 class StructureBoundaries(unittest.TestCase):
     source=SOURCE
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='structure-authored-'); self.base=Path(self.temp.name); self.root=self.base/'package';self.root.mkdir()
+        # Canonical base: macOS /var -> /private/var and Windows 8.3 temp names
+        # otherwise differ from the resolved root the checker inspects.
+        self.temp=tempfile.TemporaryDirectory(prefix='structure-authored-'); self.base=Path(self.temp.name).resolve(); self.root=self.base/'package';self.root.mkdir()
         self.ns=load(self.source,self.root)
         for name in self.ns['REQUIRED']:
             path=self.root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('# authored empty package fixture\n')
@@ -73,6 +75,7 @@ class StructureBoundaries(unittest.TestCase):
     def test_nested_package_metadata_name_not_excluded(self):
         path=self.root/'assets'/'.project-map'/'retained.pre-parity';path.parent.mkdir(parents=True);path.write_text('authored')
         self.assertEqual(self.run_main()[0],1)
+    @unittest.skipIf(os.name=='nt','Windows filenames cannot contain control characters')
     def test_backup_diagnostic_escapes_newline(self):
         (self.root/'line\nGIT_REAL_STRUCTURE_PASS\nname.pre-parity').write_text('authored')
         code,out=self.run_main();self.assertEqual(code,1)
@@ -114,7 +117,8 @@ class StructureBoundaries(unittest.TestCase):
         (self.root/'alias').symlink_to(external,target_is_directory=True)
         calls=[]
         def scan(path):
-            resolved=Path(path).resolve();resolved.relative_to(self.root);calls.append(resolved)
+            # Record before the containment check, so an enumerated alias is observable.
+            resolved=Path(path).resolve();calls.append(resolved);resolved.relative_to(self.root)
             return os.scandir(path)
         self.ns['os'].scandir=scan
         self.assertEqual(self.run_main()[0],1)
