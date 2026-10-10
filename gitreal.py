@@ -46,6 +46,7 @@ import html
 import http.server
 import json
 import os
+import pathlib
 import re
 import socketserver
 import stat
@@ -2226,7 +2227,8 @@ def stage_paths_state(root: str, pathspecs: list[str], quick: bool = True,
                 reasons.append(f"Staging pathspec exceeds the implementation ceiling of {STAGE_MAX_PATH_BYTES} bytes "
                                f"(sha256:{hashlib.sha256(encoded).hexdigest()}).")
                 continue
-            if os.path.isabs(pathspec):
+            windows_path = pathlib.PureWindowsPath(pathspec)
+            if windows_path.root or windows_path.drive:
                 reasons.append(f"Absolute staging pathspec is not supported: {pathspec!r}.")
             if pathspec.startswith("-"):
                 reasons.append(f"Staging options are not pathspecs: {pathspec!r}.")

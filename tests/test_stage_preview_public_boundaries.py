@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import pathlib
 from pathlib import Path
 import re
 import shutil
@@ -132,7 +133,7 @@ class PublicStagePreviewBoundaries(unittest.TestCase):
             if self.filter_error: raise ValueError(self.filter_error)
         def forbidden(*args, **kwargs): raise AssertionError('Non-preview backend reached')
         self.scope = source_functions({'os': self.os_view, 'sys': sys, 'stat': __import__('stat'), 'tempfile': tempfile,
-            'shutil': shutil, 'json': json, 'hashlib': hashlib, 're': re, 'argparse': argparse,
+            'shutil': shutil, 'json': json, 'hashlib': hashlib, 're': re, 'argparse': argparse, 'pathlib': pathlib,
             'GitRepo': FakeRepo, 'build_state': state, '_status_filter_preflight': filters,
             'App': forbidden, 'run_fleet': forbidden, 'requested_action': forbidden})
 
@@ -169,6 +170,22 @@ class PublicStagePreviewBoundaries(unittest.TestCase):
                 self.build_calls.clear(); self.add_calls.clear()
                 action = self.action(paths)
                 self.assertIs(action['safe'], False); self.assertEqual(self.build_calls, []); self.assertEqual(self.add_calls, [])
+
+    def test_rooted_requests_rejected_with_python313_windows_semantics(self):
+        # Python 3.13 ntpath.isabs no longer treats "/x" or "\\x" as absolute; emulate it anywhere.
+        import ntpath
+        def isabs313(p):
+            drive, rest = ntpath.splitdrive(p)
+            return bool(drive) and (rest[:1] in ('/', '\\') or drive[:2] in ('\\\\', '//'))
+        self.assertFalse(isabs313('/absolute'))
+        self.os_view.name = 'nt'
+        self.os_view.path = types.SimpleNamespace(**{**vars(os.path), 'isabs': isabs313, 'splitdrive': ntpath.splitdrive})
+        for paths in (['/absolute'], ['\\absolute'], ['C:relative'], ['C:\\absolute'], ['\\\\server\\share\\x'], ['//server/share/x']):
+            with self.subTest(paths=paths):
+                self.build_calls.clear(); self.add_calls.clear()
+                action = self.action(paths)
+                self.assertIs(action['safe'], False); self.assertEqual(self.build_calls, []); self.assertEqual(self.add_calls, [])
+                self.assertTrue(any('Absolute staging pathspec' in reason for reason in action['reasons']))
 
     def test_nonlist_request_is_structured_refusal(self):
         for value in ('new.txt', 3, {'new.txt': True}):
