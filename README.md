@@ -211,8 +211,12 @@ different action's `ALLOW` into permission.
 Read-only inspection refuses active clean/process filters before Git can run a
 configured driver, including populated submodules and untracked staging candidates.
 Installed but unused filters are allowed when complete bounded metadata establishes
-that they do not apply. This conservative boundary also applies to active Git LFS
-filters; the tool does not disable them or pretend they are side-effect-free.
+that they do not apply. The one exception is the standard Git LFS driver, trusted
+only when every configured command matches what `git lfs install` writes; other
+forms, including `--skip-smudge`, are still refused. Trusted LFS can run during
+these reads, so git-lfs may write its object store (`.git/lfs/objects`) and, on a
+repository's first git-lfs use, `lfs.repositoryformatversion` in `.git/config` and
+its hooks.
 
 The commit score evaluates the actual index when staged changes exist; otherwise
 it is only a working-tree preview. Filename-based local-data/key exclusions are
