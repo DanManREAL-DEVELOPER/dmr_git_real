@@ -191,8 +191,10 @@ class WiringBoundaries(unittest.TestCase):
         p = self.root / "AGENTS.md"
         self.stale(p)
         p.chmod(0o640)
+        # POSIX keeps 0o640; Windows only models the read-only bit, so compare with the set mode.
+        before = stat.S_IMODE(p.stat().st_mode)
         self.wire()
-        self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(p.stat().st_mode), before)
 
     def test_failed_staged_write_preserves_original(self):
         p = self.root / "AGENTS.md"

@@ -240,10 +240,13 @@ class PublicBoundaries(unittest.TestCase):
 
     def test_ignore_duplicate_and_existing_bytes(self):
         p = self.root / ".gitignore"
-        p.write_bytes(b"# authored fixture\r\nkeep")
+        before = b"# authored fixture\r\nkeep"
+        p.write_bytes(before)
         self.assertTrue(self.adapter.do_gitignore_add(str(self.root), "build/")["ok"])
         after = p.read_bytes()
-        self.assertEqual(after, b"# authored fixture\r\nkeep\nbuild/\n")
+        # Existing bytes stay intact; the appended line uses the platform newline.
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(after[len(before):].replace(b"\r\n", b"\n"), b"\nbuild/\n")
         self.assertTrue(self.adapter.do_gitignore_add(str(self.root), "build/")["ok"])
         self.assertEqual(p.read_bytes(), after)
 
@@ -257,6 +260,8 @@ class PublicBoundaries(unittest.TestCase):
         self.assertFalse(self.adapter.do_gitignore_add(str(self.root), "build/")["ok"])
 
     def test_sdk_catalog_distinguishes_mutation(self):
+        if not self.adapter._HAVE_MCP:
+            self.skipTest("optional mcp SDK is not installed (requirements-mcp.txt)")
         catalog = asyncio.run(self.adapter.mcp.list_tools())
         self.assertEqual(len(catalog), 5)
         for tool in catalog:

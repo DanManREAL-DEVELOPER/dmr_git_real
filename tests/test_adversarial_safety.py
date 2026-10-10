@@ -34,7 +34,8 @@ def repo(tmp_path):
     git(path, "init", "-q", "-b", "main")
     git(path, "config", "user.name", "Safety regression")
     git(path, "config", "user.email", "safety@example.invalid")
-    (path / "tracked.txt").write_text("base\n")
+    # Bytes, not text: Windows text mode would store "base\r\n" (6 bytes).
+    (path / "tracked.txt").write_bytes(b"base\n")
     git(path, "add", "tracked.txt")
     git(path, "commit", "-qm", "base")
     return path
@@ -131,7 +132,8 @@ def test_required_inventory_read_failure_is_not_empty(repo, failure):
 
 
 def test_rename_and_quoted_paths_are_lossless(repo):
-    new = 'build/renamed space\tquote"\nü.py'
+    # Windows filenames cannot hold tabs, quotes or newlines; non-ASCII still forces Git quoting.
+    new = 'build/renamed space ü.py' if os.name == 'nt' else 'build/renamed space\tquote"\nü.py'
     (repo / "build").mkdir()
     git(repo, "mv", "tracked.txt", new)
     state = g.build_state(g.GitRepo(str(repo)), {})

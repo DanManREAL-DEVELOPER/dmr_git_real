@@ -3606,7 +3606,7 @@ SKIP_WALK_DIRS = JUNK_DIR_NAMES | {".git", OUTPUT_DIRNAME, ".hg", ".svn", ".idea
 
 def load_registry_repo_paths(repos_file: str, *, relative_root: str | None = None) -> list[str]:
     """Load explicit fleet authority; malformed entries never widen discovery."""
-    fd = os.open(repos_file, os.O_RDONLY | os.O_NONBLOCK)
+    fd = os.open(repos_file, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError("repos file must be a regular JSON file")
@@ -3656,12 +3656,12 @@ def discover_all_git(root: str, max_depth: int = 4) -> list[str]:
     """
     root = os.path.abspath(root)
     found, seen = [], set()
-    base = root.rstrip("/").count("/")
+    base = root.rstrip(os.sep).count(os.sep)
     def walk_error(error):
         raise error
 
     for dirpath, dirnames, filenames in os.walk(root, onerror=walk_error):
-        depth = dirpath.rstrip("/").count("/") - base
+        depth = dirpath.rstrip(os.sep).count(os.sep) - base
         if depth > max_depth:
             dirnames[:] = []
             continue
@@ -3741,7 +3741,7 @@ def discover_repos(root: str, max_depth: int = 4, pinned=None) -> list[str]:
             if os.path.isdir(pp) and os.path.exists(os.path.join(pp, ".git")):
                 add(pp)
 
-    base = root.rstrip("/").count("/")
+    base = root.rstrip(os.sep).count(os.sep)
     def walk_error(error):
         raise error
 
@@ -3749,7 +3749,7 @@ def discover_repos(root: str, max_depth: int = 4, pinned=None) -> list[str]:
         if os.path.abspath(dirpath) in fleet_ignored:
             dirnames[:] = []
             continue
-        depth = dirpath.rstrip("/").count("/") - base
+        depth = dirpath.rstrip(os.sep).count(os.sep) - base
         if depth > max_depth:
             dirnames[:] = []
             continue

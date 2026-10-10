@@ -52,7 +52,8 @@ class PublicStagePreviewBoundaries(unittest.TestCase):
         deny_effects(self)
         self.temporary = tempfile.TemporaryDirectory(prefix='public-stage-preview-authored-')
         self.addCleanup(self.temporary.cleanup)
-        self.area = Path(self.temporary.name); self.root = self.area / 'target'; self.root.mkdir()
+        # Canonical temp path: staging preview compares realpath roots (macOS /private/var, Windows 8.3 names).
+        self.area = Path(self.temporary.name).resolve(); self.root = self.area / 'target'; self.root.mkdir()
         self.storage = self.area / 'authored-metadata'; self.storage.mkdir()
         self.index_file = self.storage / 'index-placeholder'; self.index_file.write_bytes(b'authored placeholder, not a Git index\n')
         self.objects = self.storage / 'objects-placeholder'; self.objects.mkdir()

@@ -55,7 +55,8 @@ class PublicCoreCliBoundaries(unittest.TestCase):
     def setUp(self):
         deny_effects(self)
         area=tempfile.TemporaryDirectory(prefix='public-core-cli-authored-');self.addCleanup(area.cleanup)
-        self.area=Path(area.name);self.root=self.area/'root';self.root.mkdir()
+        # Canonical temp path: the engine compares realpath roots (macOS /private/var, Windows 8.3 names).
+        self.area=Path(area.name).resolve();self.root=self.area/'root';self.root.mkdir()
         self.metadata=self.area/'metadata';self.metadata.mkdir()
         self.index=self.metadata/'index-placeholder';self.index.write_bytes(b'authored, not a Git index\n')
         self.env=types.SimpleNamespace(**vars(os));self.env.environ={'AUTHORED':'only'}

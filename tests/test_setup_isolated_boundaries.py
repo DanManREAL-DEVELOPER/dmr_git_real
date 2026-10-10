@@ -42,7 +42,8 @@ class InstallerBoundaries(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="public-setup-authored-")
         self.addCleanup(self.temp.cleanup)
-        self.area = Path(self.temp.name)
+        # Canonical temp path: the installer resolves its target (macOS /private/var, Windows 8.3 names).
+        self.area = Path(self.temp.name).resolve()
         self.target = self.area / "target"
         self.package = self.area / "package"
         self.target.mkdir()

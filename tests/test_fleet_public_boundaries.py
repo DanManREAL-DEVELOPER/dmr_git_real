@@ -62,7 +62,7 @@ class PublicFleetBoundaries(unittest.TestCase):
         return code,out.getvalue(),err.getvalue()
     def test_registry_valid_projection_deduplicates_and_disabled_is_not_adopted(self):
         p=self.registry({'repositories':[{'physical_location':'/authored/one','discovery_enabled':True},{'physical_location':'/authored/one'},{'physical_location':None,'discovery_enabled':False}]})
-        self.assertEqual(self.s['load_registry_repo_paths'](p),['/authored/one'])
+        self.assertEqual(self.s['load_registry_repo_paths'](p),[os.path.abspath('/authored/one')])
     def test_registry_rejects_malformed_rows_instead_of_silent_omission(self):
         for row in [4,None,{}, {'physical_location':False},{'physical_location':'/one','discovery_enabled':'false'}]:
             with self.subTest(row=row),self.assertRaises(ValueError):self.s['load_registry_repo_paths'](self.registry({'repositories':[row]}))
@@ -102,7 +102,7 @@ class PublicFleetBoundaries(unittest.TestCase):
         state=app.rescan();self.assertFalse(state['read_complete']);self.assertIn('publication',str(state['read_errors']).lower());self.assertEqual((self.root/'.git-real/git-real-fleet.json').read_bytes(),old)
     def test_repo_detail_admits_only_current_selected_paths(self):
         app=self.app(registry_paths=['/authored/one']);self.s['GitRepo']=lambda path:path;self.s['build_state']=lambda repo,c:{'path':repo}
-        self.assertEqual(app.repo_state('/outside'),{'error':'unknown repo'});self.assertEqual(app.repo_state('/authored/one'),{'path':'/authored/one'})
+        self.assertEqual(app.repo_state('/outside'),{'error':'unknown repo'});self.assertEqual(app.repo_state('/authored/one'),{'path':os.path.abspath('/authored/one')})
     def test_output_symlink_refused_and_target_preserved(self):
         outside=self.root/'outside';outside.mkdir();(self.root/'.git-real').symlink_to(outside,target_is_directory=True)
         with self.assertRaises(OSError):self.app()
@@ -209,15 +209,15 @@ class PublicFleetBoundaries(unittest.TestCase):
             s=extract();root=str(self.root);seen=[]
             def walk(path,**kw):
                 a=['.git','child','node_modules'];yield root,a,[];seen.append(list(a))
-                b=['.git','nested'];yield root+'/child',b,[];seen.append(list(b))
-                if b:yield root+'/child/nested',['.git'],[]
-                yield root+'/far/deep/outside',['.git'],[]
+                b=['.git','nested'];yield os.path.join(root,'child'),b,[];seen.append(list(b))
+                if b:yield os.path.join(root,'child','nested'),['.git'],[]
+                yield os.path.join(root,'far','deep','outside'),['.git'],[]
             s['os'].walk=walk;paths=s[name](root,max_depth=2)
-            self.assertEqual(paths,[root,root+'/child']+([root+'/child/nested'] if name=='discover_all_git' else []));self.assertNotIn('node_modules',seen[0])
+            self.assertEqual(paths,[root,os.path.join(root,'child')]+([os.path.join(root,'child','nested')] if name=='discover_all_git' else []));self.assertNotIn('node_modules',seen[0])
 
     def test_loader_regular_file_admission_and_path_whitespace(self):
         with self.assertRaises((OSError,ValueError)):self.s['load_registry_repo_paths'](str(self.root))
-        self.assertEqual(self.s['load_registry_repo_paths'](self.registry({'repos':[' /legal space ','/two']})),[os.path.abspath(' /legal space '),'/two'])
+        self.assertEqual(self.s['load_registry_repo_paths'](self.registry({'repos':[' /legal space ','/two']})),[os.path.abspath(' /legal space '),os.path.abspath('/two')])
     def test_relative_pins_select_from_fleet_root(self):
         d=self.root/'.git-real';d.mkdir();(d/'fleet.json').write_text('{"repos":["child"]}')
         child=self.root/'child';child.mkdir();(child/'.git').write_text('authored marker, not a Git repository')
